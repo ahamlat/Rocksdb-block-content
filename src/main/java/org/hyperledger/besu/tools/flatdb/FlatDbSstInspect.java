@@ -26,10 +26,12 @@ import java.util.Map;
 import java.util.concurrent.Callable;
 
 import org.bouncycastle.jcajce.provider.digest.Keccak;
+import org.rocksdb.BlockBasedTableConfig;
 import org.rocksdb.ColumnFamilyDescriptor;
 import org.rocksdb.ColumnFamilyHandle;
 import org.rocksdb.ColumnFamilyOptions;
 import org.rocksdb.DBOptions;
+import org.rocksdb.LRUCache;
 import org.rocksdb.LiveFileMetaData;
 import org.rocksdb.Options;
 import org.rocksdb.ReadOptions;
@@ -37,7 +39,9 @@ import org.rocksdb.RocksDB;
 import org.rocksdb.RocksDBException;
 import org.rocksdb.SstFileReader;
 import org.rocksdb.SstFileReaderIterator;
+import org.rocksdb.Statistics;
 import org.rocksdb.TableProperties;
+import org.rocksdb.TickerType;
 import picocli.CommandLine;
 import picocli.CommandLine.Command;
 import picocli.CommandLine.Option;
@@ -101,6 +105,14 @@ public class FlatDbSstInspect implements Callable<Integer> {
       description = "Trie type: 'account' for world state trie, 'storage' for contract storage trie (requires --address)",
       defaultValue = "storage")
   private String trieType;
+
+  // ---- Verification options ----
+
+  @Option(
+      names = {"--verify"},
+      description =
+          "After identifying block neighbors, read target then all neighbors and verify they are served from block cache")
+  private boolean verify = false;
 
   // ---- sst_dump options ----
 
@@ -246,75 +258,185 @@ public class FlatDbSstInspect implements Callable<Integer> {
 
   private int inspectCf(byte[] cfId, String cfName, byte[] targetKey, BlockFormatter formatter)
       throws Exception {
+    List<byte[]> existingCFs =
+        RocksDB.listColumnFamilies(new org.rocksdb.Options(), dbPath.getAbsolutePath());
+
+    Statistics stats = verify ? new Statistics() : null;
+    LRUCache lruCache = verify ? new LRUCache(64 * 1024 * 1024) : null;
+
     List<ColumnFamilyDescriptor> cfDescriptors = new ArrayList<>();
     List<ColumnFamilyHandle> cfHandles = new ArrayList<>();
 
-    List<byte[]> existingCFs =
-        RocksDB.listColumnFamilies(new org.rocksdb.Options(), dbPath.getAbsolutePath());
     for (byte[] cf : existingCFs) {
-      cfDescriptors.add(new ColumnFamilyDescriptor(cf, new ColumnFamilyOptions()));
+      ColumnFamilyOptions cfOpts = new ColumnFamilyOptions();
+      if (verify) {
+        BlockBasedTableConfig tableConfig = new BlockBasedTableConfig();
+        tableConfig.setBlockCache(lruCache);
+        cfOpts.setTableFormatConfig(tableConfig);
+      }
+      cfDescriptors.add(new ColumnFamilyDescriptor(cf, cfOpts));
     }
 
     ColumnFamilyHandle targetCfHandle = null;
 
-    try (DBOptions dbOptions = new DBOptions();
-        RocksDB db =
-            RocksDB.openReadOnly(dbOptions, dbPath.getAbsolutePath(), cfDescriptors, cfHandles)) {
-
-      for (int i = 0; i < cfDescriptors.size(); i++) {
-        if (Arrays.equals(cfDescriptors.get(i).getName(), cfId)) {
-          targetCfHandle = cfHandles.get(i);
-          break;
-        }
+    try (DBOptions dbOptions = new DBOptions()) {
+      if (verify && stats != null) {
+        dbOptions.setStatistics(stats);
       }
 
-      if (targetCfHandle == null) {
-        System.err.println("ERROR: Column family " + cfName + " not found in database.");
-        System.err.println("Available CFs:");
-        for (byte[] cf : existingCFs) {
-          System.err.println("  " + HEX.formatHex(cf));
+      try (RocksDB db =
+          RocksDB.openReadOnly(dbOptions, dbPath.getAbsolutePath(), cfDescriptors, cfHandles)) {
+
+        for (int i = 0; i < cfDescriptors.size(); i++) {
+          if (Arrays.equals(cfDescriptors.get(i).getName(), cfId)) {
+            targetCfHandle = cfHandles.get(i);
+            break;
+          }
         }
-        return 1;
-      }
 
-      System.out.println("Column family " + cfName + " found.");
+        if (targetCfHandle == null) {
+          System.err.println("ERROR: Column family " + cfName + " not found in database.");
+          System.err.println("Available CFs:");
+          for (byte[] cf : existingCFs) {
+            System.err.println("  " + HEX.formatHex(cf));
+          }
+          return 1;
+        }
 
-      try (ReadOptions readOptions = new ReadOptions()) {
-        byte[] value = db.get(targetCfHandle, readOptions, targetKey);
-        if (value != null) {
-          System.out.println(
-              "Key EXISTS. Value (" + value.length + " bytes): "
-                  + HEX.formatHex(value, 0, Math.min(value.length, 64))
-                  + (value.length > 64 ? "..." : ""));
+        System.out.println("Column family " + cfName + " found.");
+
+        try (ReadOptions readOptions = new ReadOptions()) {
+          byte[] value = db.get(targetCfHandle, readOptions, targetKey);
+          if (value != null) {
+            System.out.println(
+                "Key EXISTS. Value (" + value.length + " bytes): "
+                    + HEX.formatHex(value, 0, Math.min(value.length, 64))
+                    + (value.length > 64 ? "..." : ""));
+          } else {
+            System.out.println(
+                "Key NOT found in DB (may be in a different SST level or not stored).");
+          }
+        }
+        System.out.println();
+
+        SstFileInfo sstInfo = findSstForKey(db, cfId, targetKey);
+        if (sstInfo == null) {
+          System.err.println("ERROR: No SST file found whose key range contains the target key.");
+          return 1;
+        }
+
+        System.out.println("SST file: " + sstInfo.path);
+        System.out.println(
+            "  level=" + sstInfo.level + "  entries=" + sstInfo.numEntries
+                + "  size=" + formatSize(sstInfo.size));
+        System.out.println();
+
+        BlockResult br;
+        if (useSstDump) {
+          br = dumpAndParseBlocksViaSstDump(sstInfo.path, targetKey);
         } else {
-          System.out.println(
-              "Key NOT found in DB (may be in a different SST level or not stored).");
+          br = inspectBlockViaSstFileReader(sstInfo.path, targetKey);
+        }
+
+        if (br == null) {
+          return 1;
+        }
+
+        int result = formatter.format(br.keys, targetKey, br.blockNum, br.totalBlocks, br.exact);
+
+        if (verify && stats != null) {
+          verifyCacheHits(db, targetCfHandle, stats, targetKey, br.keys);
+        }
+
+        return result;
+
+      } finally {
+        for (ColumnFamilyHandle h : cfHandles) {
+          h.close();
         }
       }
-      System.out.println();
-
-      SstFileInfo sstInfo = findSstForKey(db, cfId, targetKey);
-      if (sstInfo == null) {
-        System.err.println("ERROR: No SST file found whose key range contains the target key.");
-        return 1;
-      }
-
-      System.out.println("SST file: " + sstInfo.path);
-      System.out.println(
-          "  level=" + sstInfo.level + "  entries=" + sstInfo.numEntries
-              + "  size=" + formatSize(sstInfo.size));
-      System.out.println();
-
-      if (useSstDump) {
-        return dumpAndParseBlocksViaSstDump(sstInfo.path, targetKey, formatter);
-      } else {
-        return inspectBlockViaSstFileReader(sstInfo.path, targetKey, formatter);
-      }
-
     } finally {
-      for (ColumnFamilyHandle h : cfHandles) {
-        h.close();
+      if (stats != null) stats.close();
+      if (lruCache != null) lruCache.close();
+    }
+  }
+
+  // ---- Cache verification ----
+
+  private void verifyCacheHits(
+      RocksDB db,
+      ColumnFamilyHandle cfHandle,
+      Statistics stats,
+      byte[] targetKey,
+      List<byte[]> blockKeys)
+      throws RocksDBException {
+
+    System.out.println();
+    System.out.println("=== CACHE VERIFICATION ===");
+    System.out.println();
+
+    // Phase 1: read target key to prime the block cache
+    stats.getAndResetTickerCount(TickerType.BLOCK_CACHE_DATA_MISS);
+    stats.getAndResetTickerCount(TickerType.BLOCK_CACHE_DATA_HIT);
+
+    try (ReadOptions ro = new ReadOptions()) {
+      db.get(cfHandle, ro, targetKey);
+    }
+
+    long primeMiss = stats.getTickerCount(TickerType.BLOCK_CACHE_DATA_MISS);
+    long primeHit = stats.getTickerCount(TickerType.BLOCK_CACHE_DATA_HIT);
+
+    System.out.println("Phase 1 — Read target key (prime cache):");
+    System.out.println("  BLOCK_CACHE_DATA_MISS: " + primeMiss + "  (block loaded from disk)");
+    System.out.println("  BLOCK_CACHE_DATA_HIT : " + primeHit);
+    System.out.println();
+
+    // Phase 2: read all neighbor keys and track per-key hits/misses
+    List<byte[]> neighbors = new ArrayList<>();
+    for (byte[] key : blockKeys) {
+      if (!Arrays.equals(key, targetKey)) {
+        neighbors.add(key);
       }
+    }
+
+    if (neighbors.isEmpty()) {
+      System.out.println("No neighbor keys to verify.");
+      return;
+    }
+
+    stats.getAndResetTickerCount(TickerType.BLOCK_CACHE_DATA_MISS);
+    stats.getAndResetTickerCount(TickerType.BLOCK_CACHE_DATA_HIT);
+
+    int hitCount = 0;
+    int missCount = 0;
+
+    try (ReadOptions ro = new ReadOptions()) {
+      for (byte[] neighborKey : neighbors) {
+        long missBefore = stats.getTickerCount(TickerType.BLOCK_CACHE_DATA_MISS);
+        db.get(cfHandle, ro, neighborKey);
+        long missAfter = stats.getTickerCount(TickerType.BLOCK_CACHE_DATA_MISS);
+        if (missAfter == missBefore) {
+          hitCount++;
+        } else {
+          missCount++;
+        }
+      }
+    }
+
+    long totalNeighbors = neighbors.size();
+    double hitRate = totalNeighbors > 0 ? (hitCount * 100.0 / totalNeighbors) : 0;
+
+    System.out.println("Phase 2 — Read " + totalNeighbors + " neighbor keys:");
+    System.out.println("  Cache hits  : " + hitCount + " / " + totalNeighbors);
+    System.out.println("  Cache misses: " + missCount);
+    System.out.printf("  Hit rate: %.1f%%%n", hitRate);
+    System.out.println();
+
+    if (missCount == 0) {
+      System.out.println("PASS: All neighbor keys served from block cache.");
+    } else {
+      System.out.println("PARTIAL: " + missCount + " neighbor key(s) caused additional block cache misses.");
+      System.out.println("  This can happen when keys span multiple data blocks or are in different LSM levels.");
     }
   }
 
@@ -358,8 +480,10 @@ public class FlatDbSstInspect implements Callable<Integer> {
 
   // ---- SstFileReader approach ----
 
-  private int inspectBlockViaSstFileReader(
-      String sstFilePath, byte[] targetKey, BlockFormatter formatter) throws RocksDBException {
+  private record BlockResult(List<byte[]> keys, long blockNum, long totalBlocks, boolean exact) {}
+
+  private BlockResult inspectBlockViaSstFileReader(
+      String sstFilePath, byte[] targetKey) throws RocksDBException {
     System.out.println("Using SstFileReader to inspect block contents...");
     System.out.println();
 
@@ -426,15 +550,15 @@ public class FlatDbSstInspect implements Callable<Integer> {
           iter.next();
         }
 
-        return formatter.format(blockKeys, targetKey, blockIndex + 1, numDataBlocks, foundInFile);
+        return new BlockResult(blockKeys, blockIndex + 1, numDataBlocks, foundInFile);
       }
     }
   }
 
   // ---- sst_dump approach ----
 
-  private int dumpAndParseBlocksViaSstDump(
-      String sstFilePath, byte[] targetKey, BlockFormatter formatter)
+  private BlockResult dumpAndParseBlocksViaSstDump(
+      String sstFilePath, byte[] targetKey)
       throws IOException, InterruptedException {
     Path tempFile = Files.createTempFile("sst_raw_dump_", ".txt");
     try {
@@ -451,16 +575,16 @@ public class FlatDbSstInspect implements Callable<Integer> {
       if (exitCode != 0) {
         System.err.println("sst_dump exited with code " + exitCode);
         Files.lines(tempFile).limit(20).forEach(System.err::println);
-        return 1;
+        return null;
       }
 
-      return parseRawDump(tempFile, targetKey, formatter);
+      return parseRawDump(tempFile, targetKey);
     } finally {
       Files.deleteIfExists(tempFile);
     }
   }
 
-  private int parseRawDump(Path dumpFile, byte[] targetKey, BlockFormatter formatter)
+  private BlockResult parseRawDump(Path dumpFile, byte[] targetKey)
       throws IOException {
     String targetHex = HEX.formatHex(targetKey).toUpperCase();
 
@@ -514,11 +638,11 @@ public class FlatDbSstInspect implements Callable<Integer> {
 
     if (matchedBlockKeys == null) {
       System.err.println("Target key not found in sst_dump output.");
-      return 1;
+      return null;
     }
 
     System.out.println("Exact block: " + matchedBlockHeader);
-    return formatter.format(matchedBlockKeys, targetKey, -1, totalBlocks, true);
+    return new BlockResult(matchedBlockKeys, -1, totalBlocks, true);
   }
 
   // ========================================================================
