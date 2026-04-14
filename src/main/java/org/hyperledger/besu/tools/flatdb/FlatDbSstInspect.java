@@ -412,17 +412,41 @@ public class FlatDbSstInspect implements Callable<Integer> {
     // Phase 1: read target key to prime the block cache
     stats.getAndResetTickerCount(TickerType.BLOCK_CACHE_DATA_MISS);
     stats.getAndResetTickerCount(TickerType.BLOCK_CACHE_DATA_HIT);
+    stats.getAndResetTickerCount(TickerType.BLOCK_CACHE_MISS);
+    stats.getAndResetTickerCount(TickerType.BLOCK_CACHE_HIT);
+    stats.getAndResetTickerCount(TickerType.BLOCK_CACHE_INDEX_MISS);
+    stats.getAndResetTickerCount(TickerType.BLOCK_CACHE_INDEX_HIT);
+    stats.getAndResetTickerCount(TickerType.BLOCK_CACHE_FILTER_MISS);
+    stats.getAndResetTickerCount(TickerType.BLOCK_CACHE_FILTER_HIT);
 
+    byte[] value;
     try (ReadOptions ro = new ReadOptions()) {
-      db.get(cfHandle, ro, targetKey);
+      value = db.get(cfHandle, ro, targetKey);
     }
 
     long primeMiss = stats.getTickerCount(TickerType.BLOCK_CACHE_DATA_MISS);
     long primeHit = stats.getTickerCount(TickerType.BLOCK_CACHE_DATA_HIT);
+    long totalMiss = stats.getTickerCount(TickerType.BLOCK_CACHE_MISS);
+    long totalHit = stats.getTickerCount(TickerType.BLOCK_CACHE_HIT);
+    long idxMiss = stats.getTickerCount(TickerType.BLOCK_CACHE_INDEX_MISS);
+    long idxHit = stats.getTickerCount(TickerType.BLOCK_CACHE_INDEX_HIT);
+    long filterMiss = stats.getTickerCount(TickerType.BLOCK_CACHE_FILTER_MISS);
+    long filterHit = stats.getTickerCount(TickerType.BLOCK_CACHE_FILTER_HIT);
 
     System.out.println("Phase 1 — Read target key (prime cache):");
-    System.out.println("  BLOCK_CACHE_DATA_MISS: " + primeMiss + "  (block loaded from disk)");
-    System.out.println("  BLOCK_CACHE_DATA_HIT : " + primeHit);
+    if (value != null) {
+      System.out.println("  Key EXISTS in DB. Value: " + value.length + " bytes");
+    } else {
+      System.out.println("  Key NOT FOUND in DB — bloom filters may skip data blocks entirely.");
+    }
+    System.out.println("  BLOCK_CACHE_DATA_MISS  : " + primeMiss);
+    System.out.println("  BLOCK_CACHE_DATA_HIT   : " + primeHit);
+    System.out.println("  BLOCK_CACHE_INDEX_MISS : " + idxMiss);
+    System.out.println("  BLOCK_CACHE_INDEX_HIT  : " + idxHit);
+    System.out.println("  BLOCK_CACHE_FILTER_MISS: " + filterMiss);
+    System.out.println("  BLOCK_CACHE_FILTER_HIT : " + filterHit);
+    System.out.println("  BLOCK_CACHE_TOTAL_MISS : " + totalMiss);
+    System.out.println("  BLOCK_CACHE_TOTAL_HIT  : " + totalHit);
     System.out.println();
 
     // Phase 2: read all neighbor keys and track per-key hits/misses
