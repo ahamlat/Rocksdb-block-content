@@ -409,15 +409,22 @@ public class FlatDbSstInspect implements Callable<Integer> {
     System.out.println("=== CACHE VERIFICATION ===");
     System.out.println();
 
+    // Memtable diagnostics
+    try {
+      String memEntries = db.getProperty(cfHandle, "rocksdb.num-entries-active-mem-table");
+      String memSize = db.getProperty(cfHandle, "rocksdb.cur-size-active-mem-table");
+      String immMemEntries = db.getProperty(cfHandle, "rocksdb.num-entries-imm-mem-tables");
+      System.out.println("Memtable state for this CF:");
+      System.out.println("  Active memtable entries : " + memEntries);
+      System.out.println("  Active memtable size    : " + memSize + " bytes");
+      System.out.println("  Immutable memtable entries: " + immMemEntries);
+      System.out.println();
+    } catch (RocksDBException e) {
+      System.out.println("(Could not read memtable properties: " + e.getMessage() + ")");
+    }
+
     // Phase 1: read target key to prime the block cache
-    stats.getAndResetTickerCount(TickerType.BLOCK_CACHE_DATA_MISS);
-    stats.getAndResetTickerCount(TickerType.BLOCK_CACHE_DATA_HIT);
-    stats.getAndResetTickerCount(TickerType.BLOCK_CACHE_MISS);
-    stats.getAndResetTickerCount(TickerType.BLOCK_CACHE_HIT);
-    stats.getAndResetTickerCount(TickerType.BLOCK_CACHE_INDEX_MISS);
-    stats.getAndResetTickerCount(TickerType.BLOCK_CACHE_INDEX_HIT);
-    stats.getAndResetTickerCount(TickerType.BLOCK_CACHE_FILTER_MISS);
-    stats.getAndResetTickerCount(TickerType.BLOCK_CACHE_FILTER_HIT);
+    resetAllCacheCounters(stats);
 
     byte[] value;
     try (ReadOptions ro = new ReadOptions()) {
@@ -433,6 +440,8 @@ public class FlatDbSstInspect implements Callable<Integer> {
     long filterMiss = stats.getTickerCount(TickerType.BLOCK_CACHE_FILTER_MISS);
     long filterHit = stats.getTickerCount(TickerType.BLOCK_CACHE_FILTER_HIT);
 
+    boolean targetInMemtable = (value != null && totalMiss == 0 && totalHit == 0);
+
     System.out.println("Phase 1 — Read target key (prime cache):");
     if (value != null) {
       System.out.println("  Key EXISTS in DB. Value: " + value.length + " bytes");
@@ -447,12 +456,36 @@ public class FlatDbSstInspect implements Callable<Integer> {
     System.out.println("  BLOCK_CACHE_FILTER_HIT : " + filterHit);
     System.out.println("  BLOCK_CACHE_TOTAL_MISS : " + totalMiss);
     System.out.println("  BLOCK_CACHE_TOTAL_HIT  : " + totalHit);
+    if (targetInMemtable) {
+      System.out.println("  --> Key was served from MEMTABLE (WAL replay), not from SST/block cache.");
+    }
     System.out.println();
 
+    // If target was in memtable, prime cache with the first neighbor instead
+    if (targetInMemtable && !blockKeys.isEmpty()) {
+      System.out.println("Phase 1b — Prime cache with first neighbor key (from SST):");
+      resetAllCacheCounters(stats);
+
+      byte[] firstNeighbor = blockKeys.get(0);
+      try (ReadOptions ro = new ReadOptions()) {
+        db.get(cfHandle, ro, firstNeighbor);
+      }
+
+      long p1bDataMiss = stats.getTickerCount(TickerType.BLOCK_CACHE_DATA_MISS);
+      long p1bTotalMiss = stats.getTickerCount(TickerType.BLOCK_CACHE_MISS);
+      long p1bTotalHit = stats.getTickerCount(TickerType.BLOCK_CACHE_HIT);
+      System.out.println("  BLOCK_CACHE_DATA_MISS : " + p1bDataMiss + "  (block loaded from disk)");
+      System.out.println("  BLOCK_CACHE_TOTAL_MISS: " + p1bTotalMiss);
+      System.out.println("  BLOCK_CACHE_TOTAL_HIT : " + p1bTotalHit);
+      System.out.println();
+    }
+
     // Phase 2: read all neighbor keys and track per-key hits/misses
+    byte[] firstNeighbor = blockKeys.isEmpty() ? null : blockKeys.get(0);
     List<byte[]> neighbors = new ArrayList<>();
     for (byte[] key : blockKeys) {
-      if (!Arrays.equals(key, targetKey)) {
+      if (!Arrays.equals(key, targetKey)
+          && !(targetInMemtable && firstNeighbor != null && Arrays.equals(key, firstNeighbor))) {
         neighbors.add(key);
       }
     }
@@ -462,8 +495,7 @@ public class FlatDbSstInspect implements Callable<Integer> {
       return;
     }
 
-    stats.getAndResetTickerCount(TickerType.BLOCK_CACHE_DATA_MISS);
-    stats.getAndResetTickerCount(TickerType.BLOCK_CACHE_DATA_HIT);
+    resetAllCacheCounters(stats);
 
     int hitCount = 0;
     int missCount = 0;
@@ -496,6 +528,17 @@ public class FlatDbSstInspect implements Callable<Integer> {
       System.out.println("PARTIAL: " + missCount + " neighbor key(s) caused additional block cache misses.");
       System.out.println("  This can happen when keys span multiple data blocks or are in different LSM levels.");
     }
+  }
+
+  private static void resetAllCacheCounters(Statistics stats) {
+    stats.getAndResetTickerCount(TickerType.BLOCK_CACHE_DATA_MISS);
+    stats.getAndResetTickerCount(TickerType.BLOCK_CACHE_DATA_HIT);
+    stats.getAndResetTickerCount(TickerType.BLOCK_CACHE_MISS);
+    stats.getAndResetTickerCount(TickerType.BLOCK_CACHE_HIT);
+    stats.getAndResetTickerCount(TickerType.BLOCK_CACHE_INDEX_MISS);
+    stats.getAndResetTickerCount(TickerType.BLOCK_CACHE_INDEX_HIT);
+    stats.getAndResetTickerCount(TickerType.BLOCK_CACHE_FILTER_MISS);
+    stats.getAndResetTickerCount(TickerType.BLOCK_CACHE_FILTER_HIT);
   }
 
   // ---- SST file location ----
