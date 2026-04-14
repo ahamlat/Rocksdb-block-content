@@ -1,0 +1,26 @@
+plugins {
+  id 'java'
+  id 'application'
+}
+
+group = 'org.hyperledger.besu.tools'
+version = '1.0-SNAPSHOT'
+
+java {
+  sourceCompatibility = JavaVersion.VERSION_21
+  targetCompatibility = JavaVersion.VERSION_21
+}
+
+repositories {
+  mavenCentral()
+}
+
+dependencies {
+  implementation 'org.rocksdb:rocksdbjni:9.7.3'
+  implementation 'org.bouncycastle:bcprov-jdk18on:1.80'
+  implementation 'info.picocli:picocli:4.7.6'
+}
+
+application {
+  mainClass = 'org.hyperledger.besu.tools.flatdb.FlatDbSstInspect'
+}
