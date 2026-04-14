@@ -305,17 +305,21 @@ public class FlatDbSstInspect implements Callable<Integer> {
 
         System.out.println("Column family " + cfName + " found.");
 
-        try (ReadOptions readOptions = new ReadOptions()) {
-          byte[] value = db.get(targetCfHandle, readOptions, targetKey);
-          if (value != null) {
-            System.out.println(
-                "Key EXISTS. Value (" + value.length + " bytes): "
-                    + HEX.formatHex(value, 0, Math.min(value.length, 64))
-                    + (value.length > 64 ? "..." : ""));
-          } else {
-            System.out.println(
-                "Key NOT found in DB (may be in a different SST level or not stored).");
+        if (!verify) {
+          try (ReadOptions readOptions = new ReadOptions()) {
+            byte[] value = db.get(targetCfHandle, readOptions, targetKey);
+            if (value != null) {
+              System.out.println(
+                  "Key EXISTS. Value (" + value.length + " bytes): "
+                      + HEX.formatHex(value, 0, Math.min(value.length, 64))
+                      + (value.length > 64 ? "..." : ""));
+            } else {
+              System.out.println(
+                  "Key NOT found in DB (may be in a different SST level or not stored).");
+            }
           }
+        } else {
+          System.out.println("Skipping existence check to keep block cache cold for verification.");
         }
         System.out.println();
 
