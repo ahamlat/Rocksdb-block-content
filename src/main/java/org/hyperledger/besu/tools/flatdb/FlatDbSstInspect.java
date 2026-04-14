@@ -21,8 +21,10 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.HexFormat;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.Callable;
 
 import org.bouncycastle.jcajce.provider.digest.Keccak;
@@ -50,7 +52,8 @@ import picocli.CommandLine.Option;
 public class FlatDbSstInspect implements Callable<Integer> {
 
   private static final byte[] ACCOUNT_STORAGE_CF_ID = new byte[] {8};
-  private static final long BESU_BLOCK_SIZE = 32768;
+  private static final int FLAT_KEY_LEN = 64;
+  private static final int ACCOUNT_HASH_LEN = 32;
   private static final HexFormat HEX = HexFormat.of();
 
   @Option(
@@ -98,10 +101,13 @@ public class FlatDbSstInspect implements Callable<Integer> {
     RocksDB.loadLibrary();
 
     byte[] targetKey = buildTargetKey();
+    byte[] targetAccountHash = Arrays.copyOf(targetKey, ACCOUNT_HASH_LEN);
+    byte[] targetSlotHash = Arrays.copyOfRange(targetKey, ACCOUNT_HASH_LEN, FLAT_KEY_LEN);
+
     System.out.println("=== Besu Flat-DB SST Block Inspector ===");
     System.out.println("Target key (128 hex): " + HEX.formatHex(targetKey));
-    System.out.println("  account hash : " + HEX.formatHex(targetKey, 0, 32));
-    System.out.println("  slot hash    : " + HEX.formatHex(targetKey, 32, 64));
+    System.out.println("  account hash : " + HEX.formatHex(targetAccountHash));
+    System.out.println("  slot hash    : " + HEX.formatHex(targetSlotHash));
     System.out.println();
 
     List<ColumnFamilyDescriptor> cfDescriptors = new ArrayList<>();
@@ -194,7 +200,7 @@ public class FlatDbSstInspect implements Callable<Integer> {
     if (rawKey != null && !rawKey.isBlank()) {
       String cleaned = rawKey.startsWith("0x") ? rawKey.substring(2) : rawKey;
       byte[] key = HEX.parseHex(cleaned);
-      if (key.length != 64) {
+      if (key.length != FLAT_KEY_LEN) {
         throw new IllegalArgumentException(
             "--raw-key must be exactly 64 bytes (128 hex chars), got " + key.length);
       }
@@ -207,9 +213,9 @@ public class FlatDbSstInspect implements Callable<Integer> {
     byte[] accountHash = keccak256(addressBytes);
     byte[] slotHash = keccak256(slotBytes);
 
-    byte[] key = new byte[64];
-    System.arraycopy(accountHash, 0, key, 0, 32);
-    System.arraycopy(slotHash, 0, key, 32, 32);
+    byte[] key = new byte[FLAT_KEY_LEN];
+    System.arraycopy(accountHash, 0, key, 0, ACCOUNT_HASH_LEN);
+    System.arraycopy(slotHash, 0, key, ACCOUNT_HASH_LEN, ACCOUNT_HASH_LEN);
     return key;
   }
 
@@ -266,8 +272,12 @@ public class FlatDbSstInspect implements Callable<Integer> {
 
     List<LiveFileMetaData> candidates = new ArrayList<>();
     for (LiveFileMetaData meta : cfFiles) {
-      if (compareBytes(targetKey, meta.smallestKey()) >= 0
-          && compareBytes(targetKey, meta.largestKey()) <= 0) {
+      // LiveFileMetaData keys are internal keys (user_key + 8 bytes seq/type).
+      // Extract user key portion for comparison.
+      byte[] smallest = stripInternalKeySuffix(meta.smallestKey());
+      byte[] largest = stripInternalKeySuffix(meta.largestKey());
+      if (compareBytes(targetKey, smallest) >= 0
+          && compareBytes(targetKey, largest) <= 0) {
         candidates.add(meta);
       }
     }
@@ -283,6 +293,13 @@ public class FlatDbSstInspect implements Callable<Integer> {
         chosen.level(),
         chosen.numEntries(),
         chosen.size());
+  }
+
+  private static byte[] stripInternalKeySuffix(byte[] internalKey) {
+    if (internalKey.length > 8) {
+      return Arrays.copyOf(internalKey, internalKey.length - 8);
+    }
+    return internalKey;
   }
 
   private static int compareBytes(byte[] a, byte[] b) {
@@ -323,59 +340,21 @@ public class FlatDbSstInspect implements Callable<Integer> {
       System.out.println("  entries/block: ~" + entriesPerBlock);
       System.out.println();
 
+      // SstFileReaderIterator.key() returns USER keys (no 8-byte internal suffix).
+      // This is because SstFileReader wraps the internal iterator in a DBIterator.
       try (ReadOptions readOptions = new ReadOptions();
           SstFileReaderIterator iter = reader.newIterator(readOptions)) {
 
-        // Seek to target key. The SST iterator uses user keys (no internal key suffix needed).
-        iter.seek(targetKey);
-
-        boolean exactMatch = iter.isValid() && Arrays.equals(extractUserKey(iter.key()), targetKey);
-
-        // Collect keys forward from the seek position (up to entriesPerBlock)
-        List<byte[]> forwardKeys = new ArrayList<>();
-        int forwardCount = 0;
-        // Save position: re-seek
-        iter.seek(targetKey);
-        while (iter.isValid() && forwardCount < entriesPerBlock) {
-          forwardKeys.add(extractUserKey(iter.key()));
-          forwardCount++;
-          iter.next();
-        }
-
-        // Collect keys backward from before the seek position
-        List<byte[]> backwardKeys = new ArrayList<>();
-        iter.seek(targetKey);
-        if (iter.isValid()) {
-          iter.prev();
-        } else {
-          iter.seekToLast();
-        }
-        int backwardCount = 0;
-        while (iter.isValid() && backwardCount < entriesPerBlock) {
-          backwardKeys.add(extractUserKey(iter.key()));
-          backwardCount++;
-          iter.prev();
-        }
-
-        // RocksDB builds blocks sequentially: when writing the SST, keys are added to a block
-        // until it reaches ~block_size, then a new block starts. So in a sorted sequence of
-        // keys, consecutive groups of ~entriesPerBlock keys form each block.
-        //
-        // We find our key's position in the sorted order, then compute which "block slot"
-        // it falls into: blockIndex = positionInFile / entriesPerBlock
-        // All keys with the same blockIndex are in the same block.
-
-        // We need the target's ordinal position. Seek to first, count to target.
+        // Find the target's ordinal position in this SST
         iter.seekToFirst();
         long position = 0;
         boolean foundInFile = false;
         while (iter.isValid()) {
-          byte[] userKey = extractUserKey(iter.key());
+          byte[] userKey = iter.key();
           if (Arrays.equals(userKey, targetKey)) {
             foundInFile = true;
             break;
           }
-          // If we passed the target in sort order, it's not in this file
           if (compareBytes(userKey, targetKey) > 0) {
             break;
           }
@@ -384,125 +363,123 @@ public class FlatDbSstInspect implements Callable<Integer> {
         }
 
         if (!foundInFile) {
-          // Target key not physically in this SST. Use the seek position instead:
-          // pick the block around where it would be inserted.
           System.out.println(
               "Target key not physically present in this SST (may be in a higher LSM level).");
-          System.out.println("Showing the estimated block region around the insertion point.");
+          System.out.println("Showing the estimated block region around insertion point (position ~" + position + ").");
           System.out.println();
-
-          // Use the forward/backward keys we already collected
-          return printEstimatedBlock(
-              backwardKeys, forwardKeys, targetKey, entriesPerBlock, exactMatch);
+        } else {
+          long blockIndex = position / entriesPerBlock;
+          System.out.println(
+              "Target found at position "
+                  + position
+                  + " in SST → estimated block #"
+                  + (blockIndex + 1)
+                  + " of "
+                  + numDataBlocks);
+          System.out.println();
         }
 
-        // We know the exact position. Compute block boundaries.
+        // Compute the block range: which entries belong to the same block
         long blockIndex = position / entriesPerBlock;
         long blockStart = blockIndex * entriesPerBlock;
         long blockEnd = Math.min(blockStart + entriesPerBlock, numEntries);
 
-        System.out.println(
-            "Target is at position "
-                + position
-                + " in SST (estimated block #"
-                + (blockIndex + 1)
-                + " of "
-                + numDataBlocks
-                + ")");
-        System.out.println();
-
-        // Collect all keys in this block range
+        // Collect all keys in this estimated block range
         iter.seekToFirst();
         long idx = 0;
+        // Skip to blockStart
+        while (iter.isValid() && idx < blockStart) {
+          idx++;
+          iter.next();
+        }
         List<byte[]> blockKeys = new ArrayList<>();
         while (iter.isValid() && idx < blockEnd) {
-          if (idx >= blockStart) {
-            blockKeys.add(extractUserKey(iter.key()));
-          }
+          blockKeys.add(iter.key());
           idx++;
           iter.next();
         }
 
-        return printBlockResult(blockKeys, targetKey, blockIndex + 1, numDataBlocks);
+        return printBlockResult(blockKeys, targetKey, blockIndex + 1, numDataBlocks, foundInFile);
       }
     }
-  }
-
-  private byte[] extractUserKey(byte[] internalKey) {
-    // RocksDB internal key = user_key + 8 bytes (sequence number + type)
-    if (internalKey.length > 8) {
-      return Arrays.copyOf(internalKey, internalKey.length - 8);
-    }
-    return internalKey;
-  }
-
-  private int printEstimatedBlock(
-      List<byte[]> backwardKeys,
-      List<byte[]> forwardKeys,
-      byte[] targetKey,
-      long entriesPerBlock,
-      boolean exactMatch) {
-
-    // Merge: backward (reversed) + forward, centered around target
-    List<byte[]> merged = new ArrayList<>();
-    for (int i = backwardKeys.size() - 1; i >= 0; i--) {
-      merged.add(backwardKeys.get(i));
-    }
-    merged.addAll(forwardKeys);
-
-    // Take entriesPerBlock keys centered on target position
-    int targetIdx = -1;
-    for (int i = 0; i < merged.size(); i++) {
-      if (Arrays.equals(merged.get(i), targetKey)) {
-        targetIdx = i;
-        break;
-      }
-    }
-
-    int halfBlock = (int) (entriesPerBlock / 2);
-    int start, end;
-    if (targetIdx >= 0) {
-      start = Math.max(0, targetIdx - halfBlock);
-      end = Math.min(merged.size(), start + (int) entriesPerBlock);
-    } else {
-      start = 0;
-      end = Math.min(merged.size(), (int) entriesPerBlock);
-    }
-
-    List<byte[]> blockKeys = merged.subList(start, end);
-
-    System.out.println("=== RESULT: Estimated keys in the same data block ===");
-    System.out.println("(Estimated ~" + entriesPerBlock + " keys per block)");
-    System.out.println("Keys shown: " + blockKeys.size());
-    System.out.println();
-
-    printKeys(blockKeys, targetKey);
-
-    System.out.println();
-    System.out.println(
-        "NOTE: Block boundaries are estimated. For exact boundaries,");
-    System.out.println("re-run with --use-sst-dump and sst_dump on PATH.");
-    return 0;
   }
 
   private int printBlockResult(
-      List<byte[]> blockKeys, byte[] targetKey, long blockNum, long totalBlocks) {
+      List<byte[]> blockKeys,
+      byte[] targetKey,
+      long blockNum,
+      long totalBlocks,
+      boolean exactMatch) {
 
-    System.out.println("=== RESULT: Keys in the same data block as target ===");
+    System.out.println("=== RESULT: " + (exactMatch ? "Keys" : "Estimated keys")
+        + " in the same data block as target ===");
     System.out.println("Estimated block #" + blockNum + " of " + totalBlocks);
     System.out.println("Total keys in block: " + blockKeys.size());
     System.out.println();
 
-    printKeys(blockKeys, targetKey);
+    // Group keys by account hash to show structure
+    Map<String, List<byte[]>> byAccount = new HashMap<>();
+    for (byte[] key : blockKeys) {
+      String accHash = key.length >= ACCOUNT_HASH_LEN
+          ? HEX.formatHex(key, 0, ACCOUNT_HASH_LEN)
+          : HEX.formatHex(key);
+      byAccount.computeIfAbsent(accHash, k -> new ArrayList<>()).add(key);
+    }
 
+    String targetAccHash = HEX.formatHex(targetKey, 0, ACCOUNT_HASH_LEN);
+
+    System.out.println("Keys grouped by account (contract):");
+    System.out.println(
+        "  " + byAccount.size() + " distinct account(s) in this block");
+    System.out.println();
+
+    // Print keys, grouped by account, target account first
+    List<String> accountHashes = new ArrayList<>(byAccount.keySet());
+    accountHashes.sort((a, b) -> {
+      if (a.equals(targetAccHash)) return -1;
+      if (b.equals(targetAccHash)) return 1;
+      return a.compareTo(b);
+    });
+
+    for (String accHash : accountHashes) {
+      List<byte[]> slots = byAccount.get(accHash);
+      boolean isTargetAccount = accHash.equals(targetAccHash);
+      String label = isTargetAccount
+          ? " (TARGET CONTRACT - " + slots.size() + " slots)"
+          : " (" + slots.size() + " slots)";
+      System.out.println("  Account hash: " + accHash + label);
+
+      for (byte[] key : slots) {
+        boolean isTarget = Arrays.equals(key, targetKey);
+        String slotHash = key.length == FLAT_KEY_LEN
+            ? HEX.formatHex(key, ACCOUNT_HASH_LEN, FLAT_KEY_LEN)
+            : "(unexpected key length: " + key.length + " bytes)";
+
+        if (isTarget) {
+          System.out.println("    >>> slot_hash: " + slotHash + "  <-- TARGET SLOT");
+        } else {
+          System.out.println("        slot_hash: " + slotHash);
+        }
+      }
+      System.out.println();
+    }
+
+    System.out.println("--- Summary ---");
+    System.out.println("Total keys in block: " + blockKeys.size());
+    System.out.println("Distinct accounts:   " + byAccount.size());
+    int sameAccountCount = byAccount.getOrDefault(targetAccHash, List.of()).size();
+    System.out.println("Slots for target contract in this block: " + sameAccountCount);
     System.out.println();
     System.out.println(
-        "When Besu reads this storage slot from the flat DB, RocksDB loads the");
+        "When Besu reads this storage slot, RocksDB loads the entire ~32KiB data");
     System.out.println(
-        "entire ~32KiB data block above into the block cache. All "
-            + blockKeys.size()
-            + " keys");
-    System.out.println("become cached as a side effect of that single Get().");
+        "block into the block cache. All " + blockKeys.size() + " keys above become cached.");
+    if (!exactMatch) {
+      System.out.println();
+      System.out.println(
+          "NOTE: Block boundaries are estimated from SST metadata (entries/blocks).");
+      System.out.println("For exact boundaries, re-run with --use-sst-dump and sst_dump on PATH.");
+    }
 
     return 0;
   }
@@ -513,7 +490,7 @@ public class FlatDbSstInspect implements Callable<Integer> {
       String keyHex = HEX.formatHex(key);
       String marker = isTarget ? " <-- TARGET" : "";
 
-      if (key.length == 64) {
+      if (key.length == FLAT_KEY_LEN) {
         String accHash = keyHex.substring(0, 64);
         String slotHash = keyHex.substring(64, 128);
         System.out.println((isTarget ? ">>> " : "    ") + keyHex + marker);
@@ -592,7 +569,7 @@ public class FlatDbSstInspect implements Callable<Integer> {
             int colonIdx = rest.indexOf(':');
             if (colonIdx > 0) {
               String keyHex = rest.substring(0, colonIdx).trim().toUpperCase();
-              // RocksDB internal key = user_key + 8 bytes (seq + type) = +16 hex chars
+              // sst_dump shows internal keys: user_key + 8 bytes (seq+type) = +16 hex chars
               String userKeyHex = keyHex;
               if (keyHex.length() > 16) {
                 userKeyHex = keyHex.substring(0, keyHex.length() - 16);
@@ -628,31 +605,16 @@ public class FlatDbSstInspect implements Callable<Integer> {
     System.out.println("Total keys in block: " + matchedBlockKeys.size());
     System.out.println();
 
-    for (String keyHex : matchedBlockKeys) {
-      boolean isTarget = keyHex.equalsIgnoreCase(targetHex);
-      String marker = isTarget ? " <-- TARGET" : "";
-
-      if (keyHex.length() == 128) {
-        String accHash = keyHex.substring(0, 64);
-        String slotHash = keyHex.substring(64, 128);
-        System.out.println((isTarget ? ">>> " : "    ") + keyHex + marker);
-        System.out.println(
-            "        account_hash=" + accHash.toLowerCase() + " slot_hash=" + slotHash.toLowerCase());
-      } else {
-        System.out.println((isTarget ? ">>> " : "    ") + keyHex + marker);
+    // Convert hex strings to byte arrays and use the nice grouped output
+    List<byte[]> blockKeyBytes = new ArrayList<>();
+    for (String kh : matchedBlockKeys) {
+      try {
+        blockKeyBytes.add(HEX.parseHex(kh.toLowerCase()));
+      } catch (Exception e) {
+        blockKeyBytes.add(new byte[0]);
       }
     }
-
-    System.out.println();
-    System.out.println(
-        "When Besu reads this storage slot from the flat DB, RocksDB loads the");
-    System.out.println(
-        "entire ~32KiB data block above into the block cache. All "
-            + matchedBlockKeys.size()
-            + " keys");
-    System.out.println("become cached as a side effect of that single Get().");
-
-    return 0;
+    return printBlockResult(blockKeyBytes, targetKey, -1, totalBlocks, true);
   }
 
   private static String formatSize(long bytes) {
