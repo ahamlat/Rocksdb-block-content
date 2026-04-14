@@ -20,9 +20,12 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.HexFormat;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.Callable;
 
 import org.bouncycastle.jcajce.provider.digest.Keccak;
@@ -64,7 +67,7 @@ public class FlatDbSstInspect implements Callable<Integer> {
 
   @Option(
       names = {"--mode"},
-      description = "Inspection mode: 'flat' for flat storage (default), 'account' for flat accounts, 'trie' for trie branches",
+      description = "Inspection mode: 'flat' (default), 'account', 'trie', or 'batch' (replay a file of storage reads)",
       defaultValue = "flat")
   private String mode;
 
@@ -107,6 +110,13 @@ public class FlatDbSstInspect implements Callable<Integer> {
       defaultValue = "storage")
   private String trieType;
 
+  // ---- Batch mode options ----
+
+  @Option(
+      names = {"--input-file"},
+      description = "File containing flat keys to replay (one per line, format: 'key : 0x<accHash> 0x<slotHash>')")
+  private File inputFile;
+
   // ---- Verification options ----
 
   @Option(
@@ -140,8 +150,9 @@ public class FlatDbSstInspect implements Callable<Integer> {
       case "flat" -> runFlatMode();
       case "account" -> runAccountMode();
       case "trie" -> runTrieMode();
+      case "batch" -> runBatchMode();
       default -> {
-        System.err.println("ERROR: Unknown mode '" + mode + "'. Use 'flat', 'account', or 'trie'.");
+        System.err.println("ERROR: Unknown mode '" + mode + "'. Use 'flat', 'account', 'trie', or 'batch'.");
         yield 1;
       }
     };
@@ -213,6 +224,332 @@ public class FlatDbSstInspect implements Callable<Integer> {
       throw new IllegalArgumentException("Account mode requires --address (or --raw-key)");
     }
     return keccak256(parseAddress(address));
+  }
+
+  // ========================================================================
+  // BATCH MODE: replay a file of storage reads, compute cache hit ratio
+  // ========================================================================
+
+  private static final class ByteArrayKey {
+    private final byte[] data;
+    private final int hash;
+
+    ByteArrayKey(byte[] data) {
+      this.data = data;
+      this.hash = Arrays.hashCode(data);
+    }
+
+    @Override
+    public boolean equals(Object o) {
+      return o instanceof ByteArrayKey other && Arrays.equals(data, other.data);
+    }
+
+    @Override
+    public int hashCode() {
+      return hash;
+    }
+  }
+
+  private enum ReadStatus { CACHE_HIT, CACHE_MISS, MEMTABLE, NOT_FOUND }
+
+  private record BatchKeyResult(
+      byte[] key, ReadStatus status, int valueLen, int neighborsInInput, int neighborsTotal) {}
+
+  private int runBatchMode() throws Exception {
+    if (inputFile == null) {
+      System.err.println("ERROR: --input-file is required for batch mode.");
+      return 1;
+    }
+
+    List<byte[]> keys = parseInputFile(inputFile.toPath());
+    if (keys.isEmpty()) {
+      System.err.println("ERROR: No keys parsed from input file.");
+      return 1;
+    }
+
+    Set<ByteArrayKey> keySet = new HashSet<>();
+    for (byte[] k : keys) {
+      keySet.add(new ByteArrayKey(k));
+    }
+
+    // deduplicate while preserving order
+    List<byte[]> uniqueKeys = new ArrayList<>();
+    Set<ByteArrayKey> seen = new LinkedHashSet<>();
+    for (byte[] k : keys) {
+      if (seen.add(new ByteArrayKey(k))) {
+        uniqueKeys.add(k);
+      }
+    }
+
+    System.out.println("=== Besu SST Block Inspector — BATCH mode ===");
+    System.out.println("Input file: " + inputFile.getAbsolutePath());
+    System.out.println("Total lines: " + keys.size());
+    System.out.println("Unique keys: " + uniqueKeys.size());
+    System.out.println("Column family: ACCOUNT_STORAGE_STORAGE (0x08)");
+    System.out.println();
+
+    List<byte[]> existingCFs =
+        RocksDB.listColumnFamilies(new Options(), dbPath.getAbsolutePath());
+
+    Statistics stats = new Statistics();
+    LRUCache lruCache = new LRUCache(64 * 1024 * 1024);
+
+    List<ColumnFamilyDescriptor> cfDescriptors = new ArrayList<>();
+    List<ColumnFamilyHandle> cfHandles = new ArrayList<>();
+
+    for (byte[] cf : existingCFs) {
+      ColumnFamilyOptions cfOpts = new ColumnFamilyOptions();
+      BlockBasedTableConfig tableConfig = new BlockBasedTableConfig();
+      tableConfig.setBlockCache(lruCache);
+      cfOpts.setTableFormatConfig(tableConfig);
+      cfDescriptors.add(new ColumnFamilyDescriptor(cf, cfOpts));
+    }
+
+    try (DBOptions dbOptions = new DBOptions()) {
+      dbOptions.setStatistics(stats);
+
+      try (RocksDB db =
+          RocksDB.openReadOnly(dbOptions, dbPath.getAbsolutePath(), cfDescriptors, cfHandles)) {
+
+        ColumnFamilyHandle cfHandle = null;
+        for (int i = 0; i < cfDescriptors.size(); i++) {
+          if (Arrays.equals(cfDescriptors.get(i).getName(), ACCOUNT_STORAGE_CF_ID)) {
+            cfHandle = cfHandles.get(i);
+            break;
+          }
+        }
+        if (cfHandle == null) {
+          System.err.println("ERROR: ACCOUNT_STORAGE_STORAGE CF not found.");
+          return 1;
+        }
+
+        System.out.println("Column family found. Reading " + uniqueKeys.size() + " keys sequentially...");
+        System.out.println();
+
+        List<BatchKeyResult> results = new ArrayList<>();
+        List<byte[]> missKeys = new ArrayList<>();
+
+        int hitCount = 0, missCount = 0, memCount = 0, notFoundCount = 0;
+
+        try (ReadOptions ro = new ReadOptions()) {
+          for (int i = 0; i < uniqueKeys.size(); i++) {
+            byte[] key = uniqueKeys.get(i);
+            resetAllCacheCounters(stats);
+
+            byte[] value = db.get(cfHandle, ro, key);
+
+            long dataMiss = stats.getTickerCount(TickerType.BLOCK_CACHE_DATA_MISS);
+            long totalMiss = stats.getTickerCount(TickerType.BLOCK_CACHE_MISS);
+            long totalHit = stats.getTickerCount(TickerType.BLOCK_CACHE_HIT);
+
+            ReadStatus status;
+            if (value == null) {
+              status = ReadStatus.NOT_FOUND;
+              notFoundCount++;
+            } else if (totalMiss == 0 && totalHit == 0) {
+              status = ReadStatus.MEMTABLE;
+              memCount++;
+            } else if (dataMiss > 0) {
+              status = ReadStatus.CACHE_MISS;
+              missCount++;
+              missKeys.add(key);
+            } else {
+              status = ReadStatus.CACHE_HIT;
+              hitCount++;
+            }
+
+            results.add(new BatchKeyResult(
+                key, status, value != null ? value.length : 0, -1, -1));
+
+            String accHash = HEX.formatHex(key, 0, Math.min(ACCOUNT_HASH_LEN, key.length));
+            String slotHash = key.length == FLAT_KEY_LEN
+                ? HEX.formatHex(key, ACCOUNT_HASH_LEN, FLAT_KEY_LEN) : "?";
+
+            System.out.printf("[%4d] %-10s accHash:%s slot:%s",
+                i + 1, status, accHash.substring(0, Math.min(16, accHash.length())) + "...",
+                slotHash.substring(0, Math.min(16, slotHash.length())) + "...");
+            if (value != null) {
+              System.out.printf(" value:%dB", value.length);
+            }
+            System.out.println();
+          }
+        }
+
+        System.out.println();
+
+        // Neighbor analysis for MISS keys
+        System.out.println("Analyzing block neighbors for " + missKeys.size() + " CACHE_MISS keys...");
+        System.out.println();
+
+        long totalNeighborsInInput = 0;
+        long totalNeighborsCount = 0;
+        int analyzedMisses = 0;
+
+        for (byte[] missKey : missKeys) {
+          SstFileInfo sstInfo = findSstForKeyQuiet(db, ACCOUNT_STORAGE_CF_ID, missKey);
+          if (sstInfo == null) continue;
+
+          List<byte[]> blockKeys = getBlockKeysForKey(sstInfo.path, missKey);
+          if (blockKeys == null || blockKeys.isEmpty()) continue;
+
+          int neighborsInInput = 0;
+          for (byte[] bk : blockKeys) {
+            if (keySet.contains(new ByteArrayKey(bk))) {
+              neighborsInInput++;
+            }
+          }
+
+          totalNeighborsInInput += neighborsInInput;
+          totalNeighborsCount += blockKeys.size();
+          analyzedMisses++;
+
+          String accHash = HEX.formatHex(missKey, 0, Math.min(ACCOUNT_HASH_LEN, missKey.length));
+          System.out.printf("  MISS accHash:%s  neighbors_in_input: %d / %d%n",
+              accHash.substring(0, Math.min(16, accHash.length())) + "...",
+              neighborsInInput, blockKeys.size());
+        }
+
+        // Print summary
+        System.out.println();
+        System.out.println("=== BATCH CACHE ANALYSIS SUMMARY ===");
+        System.out.println();
+
+        int total = uniqueKeys.size();
+        int found = total - notFoundCount;
+
+        System.out.println("Input keys      : " + total);
+        System.out.printf("Reads found     : %d (%.1f%%)%n", found,
+            total > 0 ? found * 100.0 / total : 0);
+        System.out.println("Not found in DB : " + notFoundCount);
+        System.out.println();
+
+        System.out.println("Cache status (of " + found + " found keys):");
+        System.out.printf("  CACHE_HIT  : %5d (%.1f%%)%n", hitCount,
+            found > 0 ? hitCount * 100.0 / found : 0);
+        System.out.printf("  CACHE_MISS : %5d (%.1f%%)%n", missCount,
+            found > 0 ? missCount * 100.0 / found : 0);
+        System.out.printf("  MEMTABLE   : %5d (%.1f%%)%n", memCount,
+            found > 0 ? memCount * 100.0 / found : 0);
+        System.out.println();
+
+        if (analyzedMisses > 0) {
+          double avgNeighborsInInput = (double) totalNeighborsInInput / analyzedMisses;
+          double avgBlockSize = (double) totalNeighborsCount / analyzedMisses;
+          System.out.println("Block neighbor analysis (" + analyzedMisses + " CACHE_MISS keys analyzed):");
+          System.out.printf("  Avg neighbors from same block also in input: %.1f / %.0f%n",
+              avgNeighborsInInput, avgBlockSize);
+          System.out.printf("  Each cold read pre-caches ~%.0f future reads for free.%n",
+              avgNeighborsInInput);
+        }
+
+        return 0;
+
+      } finally {
+        for (ColumnFamilyHandle h : cfHandles) {
+          h.close();
+        }
+      }
+    } finally {
+      stats.close();
+      lruCache.close();
+    }
+  }
+
+  private List<byte[]> parseInputFile(Path path) throws IOException {
+    List<byte[]> keys = new ArrayList<>();
+    try (BufferedReader reader = Files.newBufferedReader(path, StandardCharsets.UTF_8)) {
+      String line;
+      while ((line = reader.readLine()) != null) {
+        line = line.trim();
+        if (line.isEmpty()) continue;
+
+        // Format: "key : 0x<accHash> 0x<slotHash>"
+        if (line.startsWith("key")) {
+          int colonIdx = line.indexOf(':');
+          if (colonIdx < 0) continue;
+          String rest = line.substring(colonIdx + 1).trim();
+          String[] parts = rest.split("\\s+");
+          if (parts.length >= 2) {
+            String accHex = parts[0].startsWith("0x") ? parts[0].substring(2) : parts[0];
+            String slotHex = parts[1].startsWith("0x") ? parts[1].substring(2) : parts[1];
+            byte[] accHash = HEX.parseHex(accHex);
+            byte[] slotHash = HEX.parseHex(slotHex);
+            if (accHash.length == ACCOUNT_HASH_LEN && slotHash.length == ACCOUNT_HASH_LEN) {
+              byte[] key = new byte[FLAT_KEY_LEN];
+              System.arraycopy(accHash, 0, key, 0, ACCOUNT_HASH_LEN);
+              System.arraycopy(slotHash, 0, key, ACCOUNT_HASH_LEN, ACCOUNT_HASH_LEN);
+              keys.add(key);
+            }
+          }
+        }
+      }
+    }
+    return keys;
+  }
+
+  private SstFileInfo findSstForKeyQuiet(RocksDB db, byte[] cfId, byte[] targetKey)
+      throws RocksDBException {
+    List<LiveFileMetaData> allFiles = db.getLiveFilesMetaData();
+    List<LiveFileMetaData> candidates = new ArrayList<>();
+    for (LiveFileMetaData meta : allFiles) {
+      if (!Arrays.equals(meta.columnFamilyName(), cfId)) continue;
+      byte[] smallest = stripInternalKeySuffix(meta.smallestKey());
+      byte[] largest = stripInternalKeySuffix(meta.largestKey());
+      if (compareBytes(targetKey, smallest) >= 0 && compareBytes(targetKey, largest) <= 0) {
+        candidates.add(meta);
+      }
+    }
+    if (candidates.isEmpty()) return null;
+    candidates.sort(Comparator.comparingInt(LiveFileMetaData::level));
+    LiveFileMetaData chosen = candidates.get(0);
+    return new SstFileInfo(
+        chosen.path() + chosen.fileName(), chosen.level(),
+        chosen.numEntries(), chosen.size());
+  }
+
+  private List<byte[]> getBlockKeysForKey(String sstFilePath, byte[] targetKey)
+      throws RocksDBException {
+    try (Options options = new Options();
+        SstFileReader reader = new SstFileReader(options)) {
+      reader.open(sstFilePath);
+      TableProperties props = reader.getTableProperties();
+      long numDataBlocks = props.getNumDataBlocks();
+      long numEntries = props.getNumEntries();
+      long entriesPerBlock =
+          numDataBlocks > 0 ? Math.max(1, numEntries / numDataBlocks) : numEntries;
+
+      try (ReadOptions readOptions = new ReadOptions();
+          SstFileReaderIterator iter = reader.newIterator(readOptions)) {
+        iter.seekToFirst();
+        long position = 0;
+        while (iter.isValid()) {
+          byte[] userKey = iter.key();
+          if (Arrays.equals(userKey, targetKey) || compareBytes(userKey, targetKey) > 0) {
+            break;
+          }
+          position++;
+          iter.next();
+        }
+
+        long blockIndex = position / entriesPerBlock;
+        long blockStart = blockIndex * entriesPerBlock;
+        long blockEnd = Math.min(blockStart + entriesPerBlock, numEntries);
+
+        iter.seekToFirst();
+        long idx = 0;
+        while (iter.isValid() && idx < blockStart) {
+          idx++;
+          iter.next();
+        }
+        List<byte[]> blockKeys = new ArrayList<>();
+        while (iter.isValid() && idx < blockEnd) {
+          blockKeys.add(iter.key());
+          idx++;
+          iter.next();
+        }
+        return blockKeys;
+      }
+    }
   }
 
   // ========================================================================
