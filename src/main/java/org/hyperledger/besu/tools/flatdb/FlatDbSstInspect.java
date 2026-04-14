@@ -53,6 +53,7 @@ import picocli.CommandLine.Option;
         "Show all keys in the same RocksDB SST data block as a given Besu state key.")
 public class FlatDbSstInspect implements Callable<Integer> {
 
+  private static final byte[] ACCOUNT_INFO_CF_ID = new byte[] {6};
   private static final byte[] ACCOUNT_STORAGE_CF_ID = new byte[] {8};
   private static final byte[] TRIE_BRANCH_CF_ID = new byte[] {9};
   private static final int FLAT_KEY_LEN = 64;
@@ -63,7 +64,7 @@ public class FlatDbSstInspect implements Callable<Integer> {
 
   @Option(
       names = {"--mode"},
-      description = "Inspection mode: 'flat' for flat storage (default), 'trie' for trie branches",
+      description = "Inspection mode: 'flat' for flat storage (default), 'account' for flat accounts, 'trie' for trie branches",
       defaultValue = "flat")
   private String mode;
 
@@ -137,9 +138,10 @@ public class FlatDbSstInspect implements Callable<Integer> {
 
     return switch (mode.toLowerCase()) {
       case "flat" -> runFlatMode();
+      case "account" -> runAccountMode();
       case "trie" -> runTrieMode();
       default -> {
-        System.err.println("ERROR: Unknown mode '" + mode + "'. Use 'flat' or 'trie'.");
+        System.err.println("ERROR: Unknown mode '" + mode + "'. Use 'flat', 'account', or 'trie'.");
         yield 1;
       }
     };
@@ -183,6 +185,34 @@ public class FlatDbSstInspect implements Callable<Integer> {
     System.arraycopy(accountHash, 0, key, 0, ACCOUNT_HASH_LEN);
     System.arraycopy(slotHash, 0, key, ACCOUNT_HASH_LEN, ACCOUNT_HASH_LEN);
     return key;
+  }
+
+  // ========================================================================
+  // ACCOUNT MODE: ACCOUNT_INFO_STATE (CF 0x06)
+  // key = keccak256(address)
+  // ========================================================================
+
+  private int runAccountMode() throws Exception {
+    byte[] targetKey = buildAccountKey();
+
+    System.out.println("=== Besu SST Block Inspector — FLAT ACCOUNT mode ===");
+    System.out.println("Column family: ACCOUNT_INFO_STATE (0x06)");
+    System.out.println("Target key (" + targetKey.length * 2 + " hex): " + HEX.formatHex(targetKey));
+    System.out.println("  account hash : " + HEX.formatHex(targetKey));
+    System.out.println();
+
+    return inspectCf(ACCOUNT_INFO_CF_ID, "ACCOUNT_INFO_STATE", targetKey,
+        this::formatAccountFlatBlockResult);
+  }
+
+  private byte[] buildAccountKey() {
+    if (rawKey != null && !rawKey.isBlank()) {
+      return parseRawHexKey(rawKey);
+    }
+    if (address == null) {
+      throw new IllegalArgumentException("Account mode requires --address (or --raw-key)");
+    }
+    return keccak256(parseAddress(address));
   }
 
   // ========================================================================
@@ -698,6 +728,31 @@ public class FlatDbSstInspect implements Callable<Integer> {
       }
       System.out.println();
     }
+
+    printSummary(blockKeys.size(), exact);
+    return 0;
+  }
+
+  private int formatAccountFlatBlockResult(
+      List<byte[]> blockKeys, byte[] targetKey, long blockNum, long totalBlocks, boolean exact) {
+
+    System.out.println("=== RESULT: " + (exact ? "" : "Estimated ") + "accounts in same data block ===");
+    if (blockNum > 0) {
+      System.out.println("Block #" + blockNum + " of " + totalBlocks);
+    }
+    System.out.println("Total keys in block: " + blockKeys.size());
+    System.out.println();
+
+    String targetHex = HEX.formatHex(targetKey);
+
+    for (byte[] key : blockKeys) {
+      boolean isTarget = Arrays.equals(key, targetKey);
+      String accHash = HEX.formatHex(key);
+      System.out.println(
+          (isTarget ? ">>> " : "    ") + "account_hash: " + accHash
+              + (isTarget ? "  <-- TARGET" : ""));
+    }
+    System.out.println();
 
     printSummary(blockKeys.size(), exact);
     return 0;
