@@ -30,25 +30,10 @@ This tool replicates that exact encoding so it can look up the right key in Rock
 ## Prerequisites
 
 - **JDK 21+**
-- **`sst_dump`** from RocksDB 9.7.x on your `PATH` (must match the RocksDB version Besu uses)
 - A **copy of the Besu RocksDB data directory**, or stop the Besu node before running (RocksDB locks the directory)
+- *(Optional)* **`sst_dump`** from RocksDB 9.7.x for exact block boundaries (see `--use-sst-dump` flag)
 
-### Installing sst_dump
-
-On Ubuntu/Debian:
-```bash
-# Build from source (recommended to match version 9.7.3)
-git clone --branch v9.7.3 https://github.com/facebook/rocksdb.git
-cd rocksdb
-make sst_dump
-sudo cp sst_dump /usr/local/bin/
-```
-
-On macOS with Homebrew:
-```bash
-brew install rocksdb
-# sst_dump is typically at /usr/local/bin/sst_dump or /opt/homebrew/bin/sst_dump
-```
+By default the tool uses `SstFileReader` from `rocksdbjni` — **no external binary needed**.
 
 ## Build
 
@@ -74,6 +59,7 @@ cd Rocksdb-block-content
 | `--address` | Yes* | Contract address (hex with 0x prefix) |
 | `--slot` | Yes* | Storage slot index (hex with 0x prefix, or decimal) |
 | `--raw-key` | No | Pre-computed 64-byte key (128 hex chars) — use instead of address+slot |
+| `--use-sst-dump` | No | Use external `sst_dump` binary for exact block boundaries |
 | `--sst-dump-path` | No | Path to the `sst_dump` binary (default: `sst_dump` on PATH) |
 
 \* Not required if `--raw-key` is provided.
@@ -119,8 +105,9 @@ become cached as a side effect of that single Get().
 2. **Opens the RocksDB database read-only** and locates the `ACCOUNT_STORAGE_STORAGE` column family (id `0x08`)
 3. **Verifies the key exists** with a `Get()` call
 4. **Finds the SST file** using `getLiveFilesMetaData()` — selects the file whose key range contains the target
-5. **Runs `sst_dump --command=raw`** on that SST file, which outputs keys grouped by data block
-6. **Parses the output** to find the data block containing the target key and prints all co-resident keys
+5. **Lists co-block keys** using one of two approaches:
+   - *(default)* Opens the SST with `SstFileReader`, reads `TableProperties` (number of data blocks, entries), computes entries-per-block, and locates the block region containing the target key — **no external binary needed**
+   - *(with `--use-sst-dump`)* Runs `sst_dump --command=raw` for exact block boundaries parsed from the dump output
 
 ## Reference
 
