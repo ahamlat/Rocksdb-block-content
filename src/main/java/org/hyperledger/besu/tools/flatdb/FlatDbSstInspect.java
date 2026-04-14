@@ -1,13 +1,11 @@
 /*
  * Standalone tool to inspect which RocksDB keys share the same SST data block
- * as a given Besu flat-DB storage slot key.
+ * as a given Besu key in the Bonsai state database.
  *
- * Key encoding mirrors Besu's BonsaiFlatDbStrategy:
- *   ACCOUNT_STORAGE_STORAGE CF (id = 0x08)
- *   key = keccak256(address_20_bytes) || keccak256(slot_as_uint256_32_bytes)
- *
- * Usage:
- *   ./gradlew run --args='--db-path /data/besu/database --address 0xdAC17F958D2ee523a2206206994597C13D831ec7 --slot 0x2'
+ * Supports two modes:
+ *   flat  - ACCOUNT_STORAGE_STORAGE CF (id 0x08), key = keccak256(addr) || keccak256(slot)
+ *   trie  - TRIE_BRANCH_STORAGE CF (id 0x09), key = location (account trie) or
+ *           keccak256(addr) || location (storage trie)
  */
 package org.hyperledger.besu.tools.flatdb;
 
@@ -45,16 +43,27 @@ import picocli.CommandLine.Command;
 import picocli.CommandLine.Option;
 
 @Command(
-    name = "flatdb-sst-inspect",
+    name = "besu-sst-inspect",
     mixinStandardHelpOptions = true,
     description =
-        "Show all keys in the same RocksDB SST data block as a given Besu flat-DB storage slot.")
+        "Show all keys in the same RocksDB SST data block as a given Besu state key.")
 public class FlatDbSstInspect implements Callable<Integer> {
 
   private static final byte[] ACCOUNT_STORAGE_CF_ID = new byte[] {8};
+  private static final byte[] TRIE_BRANCH_CF_ID = new byte[] {9};
   private static final int FLAT_KEY_LEN = 64;
   private static final int ACCOUNT_HASH_LEN = 32;
   private static final HexFormat HEX = HexFormat.of();
+
+  // ---- Mode selection ----
+
+  @Option(
+      names = {"--mode"},
+      description = "Inspection mode: 'flat' for flat storage (default), 'trie' for trie branches",
+      defaultValue = "flat")
+  private String mode;
+
+  // ---- Common options ----
 
   @Option(
       names = {"--db-path"},
@@ -64,26 +73,40 @@ public class FlatDbSstInspect implements Callable<Integer> {
 
   @Option(
       names = {"--address"},
-      required = true,
       description = "Contract address (hex, e.g. 0xdAC17F958D2ee523a2206206994597C13D831ec7)")
   private String address;
 
+  // ---- Flat mode options ----
+
   @Option(
       names = {"--slot"},
-      required = true,
-      description = "Storage slot index (hex or decimal, e.g. 0x2 or 2)")
+      description = "Storage slot index (hex or decimal, e.g. 0x2 or 2). Used in flat mode.")
   private String slot;
 
   @Option(
       names = {"--raw-key"},
-      description =
-          "Use a pre-computed 64-byte hex key instead of --address/--slot (128 hex chars)")
+      description = "Use a pre-computed hex key directly (bypasses address/slot/location encoding)")
   private String rawKey;
+
+  // ---- Trie mode options ----
+
+  @Option(
+      names = {"--location"},
+      description =
+          "Trie node location as hex nibble path (e.g. 0x01 or 0x0a0b). Used in trie mode.")
+  private String location;
+
+  @Option(
+      names = {"--trie-type"},
+      description = "Trie type: 'account' for world state trie, 'storage' for contract storage trie (requires --address)",
+      defaultValue = "storage")
+  private String trieType;
+
+  // ---- sst_dump options ----
 
   @Option(
       names = {"--use-sst-dump"},
-      description =
-          "Use external sst_dump binary for exact block boundaries (default: use built-in SstFileReader)")
+      description = "Use external sst_dump binary for exact block boundaries")
   private boolean useSstDump = false;
 
   @Option(
@@ -100,16 +123,129 @@ public class FlatDbSstInspect implements Callable<Integer> {
   public Integer call() throws Exception {
     RocksDB.loadLibrary();
 
-    byte[] targetKey = buildTargetKey();
-    byte[] targetAccountHash = Arrays.copyOf(targetKey, ACCOUNT_HASH_LEN);
-    byte[] targetSlotHash = Arrays.copyOfRange(targetKey, ACCOUNT_HASH_LEN, FLAT_KEY_LEN);
+    return switch (mode.toLowerCase()) {
+      case "flat" -> runFlatMode();
+      case "trie" -> runTrieMode();
+      default -> {
+        System.err.println("ERROR: Unknown mode '" + mode + "'. Use 'flat' or 'trie'.");
+        yield 1;
+      }
+    };
+  }
 
-    System.out.println("=== Besu Flat-DB SST Block Inspector ===");
-    System.out.println("Target key (128 hex): " + HEX.formatHex(targetKey));
-    System.out.println("  account hash : " + HEX.formatHex(targetAccountHash));
-    System.out.println("  slot hash    : " + HEX.formatHex(targetSlotHash));
+  // ========================================================================
+  // FLAT MODE: ACCOUNT_STORAGE_STORAGE (CF 0x08)
+  // key = keccak256(address) || keccak256(slot)
+  // ========================================================================
+
+  private int runFlatMode() throws Exception {
+    byte[] targetKey = buildFlatKey();
+
+    System.out.println("=== Besu SST Block Inspector — FLAT STORAGE mode ===");
+    System.out.println("Column family: ACCOUNT_STORAGE_STORAGE (0x08)");
+    System.out.println("Target key (" + targetKey.length * 2 + " hex): " + HEX.formatHex(targetKey));
+    if (targetKey.length == FLAT_KEY_LEN) {
+      System.out.println("  account hash : " + HEX.formatHex(targetKey, 0, ACCOUNT_HASH_LEN));
+      System.out.println("  slot hash    : " + HEX.formatHex(targetKey, ACCOUNT_HASH_LEN, FLAT_KEY_LEN));
+    }
     System.out.println();
 
+    return inspectCf(ACCOUNT_STORAGE_CF_ID, "ACCOUNT_STORAGE_STORAGE", targetKey,
+        this::formatFlatBlockResult);
+  }
+
+  private byte[] buildFlatKey() {
+    if (rawKey != null && !rawKey.isBlank()) {
+      return parseRawHexKey(rawKey);
+    }
+    if (address == null || slot == null) {
+      throw new IllegalArgumentException("Flat mode requires --address and --slot (or --raw-key)");
+    }
+
+    byte[] addressBytes = parseAddress(address);
+    byte[] slotBytes = parseSlotAsUint256(slot);
+    byte[] accountHash = keccak256(addressBytes);
+    byte[] slotHash = keccak256(slotBytes);
+
+    byte[] key = new byte[FLAT_KEY_LEN];
+    System.arraycopy(accountHash, 0, key, 0, ACCOUNT_HASH_LEN);
+    System.arraycopy(slotHash, 0, key, ACCOUNT_HASH_LEN, ACCOUNT_HASH_LEN);
+    return key;
+  }
+
+  // ========================================================================
+  // TRIE MODE: TRIE_BRANCH_STORAGE (CF 0x09)
+  //   account trie: key = location (nibble path bytes, variable length)
+  //   storage trie: key = keccak256(address) || location
+  // ========================================================================
+
+  private int runTrieMode() throws Exception {
+    byte[] targetKey = buildTrieKey();
+
+    System.out.println("=== Besu SST Block Inspector — TRIE BRANCH mode ===");
+    System.out.println("Column family: TRIE_BRANCH_STORAGE (0x09)");
+    System.out.println("Trie type: " + trieType);
+    System.out.println("Target key (" + targetKey.length * 2 + " hex): " + HEX.formatHex(targetKey));
+    if (trieType.equalsIgnoreCase("storage") && targetKey.length > ACCOUNT_HASH_LEN) {
+      System.out.println("  account hash : " + HEX.formatHex(targetKey, 0, ACCOUNT_HASH_LEN));
+      System.out.println("  location     : " + HEX.formatHex(targetKey, ACCOUNT_HASH_LEN, targetKey.length));
+    } else {
+      System.out.println("  location     : " + HEX.formatHex(targetKey));
+    }
+    System.out.println();
+
+    return inspectCf(TRIE_BRANCH_CF_ID, "TRIE_BRANCH_STORAGE", targetKey,
+        trieType.equalsIgnoreCase("storage")
+            ? this::formatStorageTrieBlockResult
+            : this::formatAccountTrieBlockResult);
+  }
+
+  private byte[] buildTrieKey() {
+    if (rawKey != null && !rawKey.isBlank()) {
+      return parseRawHexKey(rawKey);
+    }
+
+    byte[] locationBytes = parseLocationBytes(location);
+
+    if (trieType.equalsIgnoreCase("account")) {
+      return locationBytes;
+    }
+
+    // storage trie: keccak256(address) || location
+    if (address == null) {
+      throw new IllegalArgumentException(
+          "Storage trie mode requires --address (or use --trie-type account)");
+    }
+    byte[] accountHash = keccak256(parseAddress(address));
+    byte[] key = new byte[ACCOUNT_HASH_LEN + locationBytes.length];
+    System.arraycopy(accountHash, 0, key, 0, ACCOUNT_HASH_LEN);
+    System.arraycopy(locationBytes, 0, key, ACCOUNT_HASH_LEN, locationBytes.length);
+    return key;
+  }
+
+  private static byte[] parseLocationBytes(String loc) {
+    if (loc == null || loc.isBlank()) {
+      return new byte[0]; // root node
+    }
+    String cleaned = loc.startsWith("0x") ? loc.substring(2) : loc;
+    if (cleaned.isEmpty()) {
+      return new byte[0];
+    }
+    return HEX.parseHex(cleaned);
+  }
+
+  // ========================================================================
+  // Common DB + SST inspection logic
+  // ========================================================================
+
+  @FunctionalInterface
+  private interface BlockFormatter {
+    int format(List<byte[]> blockKeys, byte[] targetKey, long blockNum, long totalBlocks,
+        boolean exact);
+  }
+
+  private int inspectCf(byte[] cfId, String cfName, byte[] targetKey, BlockFormatter formatter)
+      throws Exception {
     List<ColumnFamilyDescriptor> cfDescriptors = new ArrayList<>();
     List<ColumnFamilyHandle> cfHandles = new ArrayList<>();
 
@@ -119,72 +255,60 @@ public class FlatDbSstInspect implements Callable<Integer> {
       cfDescriptors.add(new ColumnFamilyDescriptor(cf, new ColumnFamilyOptions()));
     }
 
-    ColumnFamilyHandle storageCfHandle = null;
+    ColumnFamilyHandle targetCfHandle = null;
 
     try (DBOptions dbOptions = new DBOptions();
         RocksDB db =
-            RocksDB.openReadOnly(
-                dbOptions, dbPath.getAbsolutePath(), cfDescriptors, cfHandles)) {
+            RocksDB.openReadOnly(dbOptions, dbPath.getAbsolutePath(), cfDescriptors, cfHandles)) {
 
       for (int i = 0; i < cfDescriptors.size(); i++) {
-        if (Arrays.equals(cfDescriptors.get(i).getName(), ACCOUNT_STORAGE_CF_ID)) {
-          storageCfHandle = cfHandles.get(i);
+        if (Arrays.equals(cfDescriptors.get(i).getName(), cfId)) {
+          targetCfHandle = cfHandles.get(i);
           break;
         }
       }
 
-      if (storageCfHandle == null) {
-        System.err.println(
-            "ERROR: Column family ACCOUNT_STORAGE_STORAGE (0x08) not found in database.");
+      if (targetCfHandle == null) {
+        System.err.println("ERROR: Column family " + cfName + " not found in database.");
         System.err.println("Available CFs:");
         for (byte[] cf : existingCFs) {
-          System.err.println(
-              "  " + HEX.formatHex(cf) + " (" + new String(cf, StandardCharsets.UTF_8) + ")");
+          System.err.println("  " + HEX.formatHex(cf));
         }
         return 1;
       }
 
-      System.out.println("Column family ACCOUNT_STORAGE_STORAGE (0x08) found.");
+      System.out.println("Column family " + cfName + " found.");
 
       try (ReadOptions readOptions = new ReadOptions()) {
-        byte[] value = db.get(storageCfHandle, readOptions, targetKey);
+        byte[] value = db.get(targetCfHandle, readOptions, targetKey);
         if (value != null) {
           System.out.println(
-              "Key EXISTS in flat DB. Value ("
-                  + value.length
-                  + " bytes): "
-                  + HEX.formatHex(value));
+              "Key EXISTS. Value (" + value.length + " bytes): "
+                  + HEX.formatHex(value, 0, Math.min(value.length, 64))
+                  + (value.length > 64 ? "..." : ""));
         } else {
           System.out.println(
-              "WARNING: Key NOT found in flat DB. The slot may not be stored or the"
-                  + " encoding may differ.");
-          System.out.println(
-              "  (This is OK — we still locate the SST whose key range covers this key)");
+              "Key NOT found in DB (may be in a different SST level or not stored).");
         }
       }
       System.out.println();
 
-      SstFileInfo sstInfo = findSstForKey(db, targetKey);
+      SstFileInfo sstInfo = findSstForKey(db, cfId, targetKey);
       if (sstInfo == null) {
-        System.err.println(
-            "ERROR: Could not find an SST file whose key range contains the target key.");
+        System.err.println("ERROR: No SST file found whose key range contains the target key.");
         return 1;
       }
 
-      System.out.println("SST file containing key: " + sstInfo.path);
+      System.out.println("SST file: " + sstInfo.path);
       System.out.println(
-          "  level="
-              + sstInfo.level
-              + "  entries="
-              + sstInfo.numEntries
-              + "  size="
-              + formatSize(sstInfo.size));
+          "  level=" + sstInfo.level + "  entries=" + sstInfo.numEntries
+              + "  size=" + formatSize(sstInfo.size));
       System.out.println();
 
       if (useSstDump) {
-        return dumpAndParseBlocksViaSstDump(sstInfo.path, targetKey);
+        return dumpAndParseBlocksViaSstDump(sstInfo.path, targetKey, formatter);
       } else {
-        return inspectBlockViaSstFileReader(sstInfo.path, targetKey);
+        return inspectBlockViaSstFileReader(sstInfo.path, targetKey, formatter);
       }
 
     } finally {
@@ -194,29 +318,353 @@ public class FlatDbSstInspect implements Callable<Integer> {
     }
   }
 
-  // ---- Key encoding (mirrors Besu's BonsaiFlatDbStrategy) ----
+  // ---- SST file location ----
 
-  private byte[] buildTargetKey() {
-    if (rawKey != null && !rawKey.isBlank()) {
-      String cleaned = rawKey.startsWith("0x") ? rawKey.substring(2) : rawKey;
-      byte[] key = HEX.parseHex(cleaned);
-      if (key.length != FLAT_KEY_LEN) {
-        throw new IllegalArgumentException(
-            "--raw-key must be exactly 64 bytes (128 hex chars), got " + key.length);
+  private record SstFileInfo(String path, int level, long numEntries, long size) {}
+
+  private SstFileInfo findSstForKey(RocksDB db, byte[] cfId, byte[] targetKey)
+      throws RocksDBException {
+    List<LiveFileMetaData> allFiles = db.getLiveFilesMetaData();
+
+    List<LiveFileMetaData> cfFiles = new ArrayList<>();
+    for (LiveFileMetaData meta : allFiles) {
+      if (Arrays.equals(meta.columnFamilyName(), cfId)) {
+        cfFiles.add(meta);
       }
-      return key;
     }
 
-    byte[] addressBytes = parseAddress(address);
-    byte[] slotBytes = parseSlotAsUint256(slot);
+    System.out.println("Found " + cfFiles.size() + " SST files for this CF.");
 
-    byte[] accountHash = keccak256(addressBytes);
-    byte[] slotHash = keccak256(slotBytes);
+    List<LiveFileMetaData> candidates = new ArrayList<>();
+    for (LiveFileMetaData meta : cfFiles) {
+      byte[] smallest = stripInternalKeySuffix(meta.smallestKey());
+      byte[] largest = stripInternalKeySuffix(meta.largestKey());
+      if (compareBytes(targetKey, smallest) >= 0
+          && compareBytes(targetKey, largest) <= 0) {
+        candidates.add(meta);
+      }
+    }
 
-    byte[] key = new byte[FLAT_KEY_LEN];
-    System.arraycopy(accountHash, 0, key, 0, ACCOUNT_HASH_LEN);
-    System.arraycopy(slotHash, 0, key, ACCOUNT_HASH_LEN, ACCOUNT_HASH_LEN);
-    return key;
+    if (candidates.isEmpty()) {
+      return null;
+    }
+
+    candidates.sort(Comparator.comparingInt(LiveFileMetaData::level));
+    LiveFileMetaData chosen = candidates.get(0);
+    return new SstFileInfo(
+        chosen.path() + chosen.fileName(), chosen.level(),
+        chosen.numEntries(), chosen.size());
+  }
+
+  // ---- SstFileReader approach ----
+
+  private int inspectBlockViaSstFileReader(
+      String sstFilePath, byte[] targetKey, BlockFormatter formatter) throws RocksDBException {
+    System.out.println("Using SstFileReader to inspect block contents...");
+    System.out.println();
+
+    try (Options options = new Options();
+        SstFileReader reader = new SstFileReader(options)) {
+
+      reader.open(sstFilePath);
+      TableProperties props = reader.getTableProperties();
+
+      long numDataBlocks = props.getNumDataBlocks();
+      long numEntries = props.getNumEntries();
+      long dataSize = props.getDataSize();
+      long entriesPerBlock =
+          numDataBlocks > 0 ? Math.max(1, numEntries / numDataBlocks) : numEntries;
+
+      System.out.println("SST properties:");
+      System.out.println("  data blocks  : " + numDataBlocks);
+      System.out.println("  total entries: " + numEntries);
+      System.out.println("  data size    : " + formatSize(dataSize));
+      System.out.println("  entries/block: ~" + entriesPerBlock);
+      System.out.println();
+
+      try (ReadOptions readOptions = new ReadOptions();
+          SstFileReaderIterator iter = reader.newIterator(readOptions)) {
+
+        iter.seekToFirst();
+        long position = 0;
+        boolean foundInFile = false;
+        while (iter.isValid()) {
+          byte[] userKey = iter.key();
+          if (Arrays.equals(userKey, targetKey)) {
+            foundInFile = true;
+            break;
+          }
+          if (compareBytes(userKey, targetKey) > 0) {
+            break;
+          }
+          position++;
+          iter.next();
+        }
+
+        long blockIndex = position / entriesPerBlock;
+        long blockStart = blockIndex * entriesPerBlock;
+        long blockEnd = Math.min(blockStart + entriesPerBlock, numEntries);
+
+        if (foundInFile) {
+          System.out.println("Target at position " + position
+              + " → estimated block #" + (blockIndex + 1) + " of " + numDataBlocks);
+        } else {
+          System.out.println("Target not physically in this SST. Estimated insertion point: position " + position);
+        }
+        System.out.println();
+
+        iter.seekToFirst();
+        long idx = 0;
+        while (iter.isValid() && idx < blockStart) {
+          idx++;
+          iter.next();
+        }
+        List<byte[]> blockKeys = new ArrayList<>();
+        while (iter.isValid() && idx < blockEnd) {
+          blockKeys.add(iter.key());
+          idx++;
+          iter.next();
+        }
+
+        return formatter.format(blockKeys, targetKey, blockIndex + 1, numDataBlocks, foundInFile);
+      }
+    }
+  }
+
+  // ---- sst_dump approach ----
+
+  private int dumpAndParseBlocksViaSstDump(
+      String sstFilePath, byte[] targetKey, BlockFormatter formatter)
+      throws IOException, InterruptedException {
+    Path tempFile = Files.createTempFile("sst_raw_dump_", ".txt");
+    try {
+      System.out.println("Running sst_dump --command=raw on " + sstFilePath + " ...");
+      System.out.println();
+
+      ProcessBuilder pb =
+          new ProcessBuilder(sstDumpPath, "--file=" + sstFilePath, "--command=raw");
+      pb.redirectOutput(tempFile.toFile());
+      pb.redirectErrorStream(true);
+      Process proc = pb.start();
+      int exitCode = proc.waitFor();
+
+      if (exitCode != 0) {
+        System.err.println("sst_dump exited with code " + exitCode);
+        Files.lines(tempFile).limit(20).forEach(System.err::println);
+        return 1;
+      }
+
+      return parseRawDump(tempFile, targetKey, formatter);
+    } finally {
+      Files.deleteIfExists(tempFile);
+    }
+  }
+
+  private int parseRawDump(Path dumpFile, byte[] targetKey, BlockFormatter formatter)
+      throws IOException {
+    String targetHex = HEX.formatHex(targetKey).toUpperCase();
+
+    List<byte[]> currentBlockKeys = new ArrayList<>();
+    String currentBlockHeader = null;
+    boolean foundTarget = false;
+    List<byte[]> matchedBlockKeys = null;
+    String matchedBlockHeader = null;
+    int totalBlocks = 0;
+
+    try (BufferedReader reader = Files.newBufferedReader(dumpFile)) {
+      String line;
+      while ((line = reader.readLine()) != null) {
+        if (line.startsWith("Data Block #")) {
+          if (foundTarget && matchedBlockKeys == null) {
+            matchedBlockKeys = new ArrayList<>(currentBlockKeys);
+            matchedBlockHeader = currentBlockHeader;
+          }
+          totalBlocks++;
+          currentBlockKeys.clear();
+          currentBlockHeader = line.trim();
+          foundTarget = false;
+          continue;
+        }
+        if (line.startsWith("  HEX ") || line.startsWith(" HEX ")) {
+          String trimmed = line.trim();
+          if (trimmed.startsWith("HEX ")) {
+            String rest = trimmed.substring(4);
+            int colonIdx = rest.indexOf(':');
+            if (colonIdx > 0) {
+              String keyHex = rest.substring(0, colonIdx).trim().toUpperCase();
+              String userKeyHex = keyHex.length() > 16
+                  ? keyHex.substring(0, keyHex.length() - 16) : keyHex;
+              try {
+                currentBlockKeys.add(HEX.parseHex(userKeyHex.toLowerCase()));
+              } catch (Exception e) {
+                // skip malformed
+              }
+              if (userKeyHex.equalsIgnoreCase(targetHex)) {
+                foundTarget = true;
+              }
+            }
+          }
+        }
+      }
+      if (foundTarget && matchedBlockKeys == null) {
+        matchedBlockKeys = new ArrayList<>(currentBlockKeys);
+        matchedBlockHeader = currentBlockHeader;
+      }
+    }
+
+    if (matchedBlockKeys == null) {
+      System.err.println("Target key not found in sst_dump output.");
+      return 1;
+    }
+
+    System.out.println("Exact block: " + matchedBlockHeader);
+    return formatter.format(matchedBlockKeys, targetKey, -1, totalBlocks, true);
+  }
+
+  // ========================================================================
+  // Output formatters
+  // ========================================================================
+
+  private int formatFlatBlockResult(
+      List<byte[]> blockKeys, byte[] targetKey, long blockNum, long totalBlocks, boolean exact) {
+
+    System.out.println("=== RESULT: " + (exact ? "" : "Estimated ") + "keys in same data block ===");
+    if (blockNum > 0) {
+      System.out.println("Block #" + blockNum + " of " + totalBlocks);
+    }
+    System.out.println("Total keys in block: " + blockKeys.size());
+    System.out.println();
+
+    Map<String, List<byte[]>> byAccount = new HashMap<>();
+    for (byte[] key : blockKeys) {
+      String accHash = key.length >= ACCOUNT_HASH_LEN
+          ? HEX.formatHex(key, 0, ACCOUNT_HASH_LEN) : HEX.formatHex(key);
+      byAccount.computeIfAbsent(accHash, k -> new ArrayList<>()).add(key);
+    }
+
+    String targetAccHash = targetKey.length >= ACCOUNT_HASH_LEN
+        ? HEX.formatHex(targetKey, 0, ACCOUNT_HASH_LEN) : "";
+
+    System.out.println(byAccount.size() + " distinct account(s) in this block:");
+    System.out.println();
+
+    List<String> accountHashes = new ArrayList<>(byAccount.keySet());
+    accountHashes.sort((a, b) -> {
+      if (a.equals(targetAccHash)) return -1;
+      if (b.equals(targetAccHash)) return 1;
+      return a.compareTo(b);
+    });
+
+    for (String accHash : accountHashes) {
+      List<byte[]> slots = byAccount.get(accHash);
+      boolean isTgt = accHash.equals(targetAccHash);
+      System.out.println("  Account: " + accHash
+          + (isTgt ? " (TARGET - " + slots.size() + " slots)" : " (" + slots.size() + " slots)"));
+      for (byte[] key : slots) {
+        boolean isTarget = Arrays.equals(key, targetKey);
+        String slotHash = key.length == FLAT_KEY_LEN
+            ? HEX.formatHex(key, ACCOUNT_HASH_LEN, FLAT_KEY_LEN) : "?";
+        System.out.println(
+            (isTarget ? "    >>> " : "        ") + "slot_hash: " + slotHash
+                + (isTarget ? "  <-- TARGET" : ""));
+      }
+      System.out.println();
+    }
+
+    printSummary(blockKeys.size(), exact);
+    return 0;
+  }
+
+  private int formatStorageTrieBlockResult(
+      List<byte[]> blockKeys, byte[] targetKey, long blockNum, long totalBlocks, boolean exact) {
+
+    System.out.println("=== RESULT: " + (exact ? "" : "Estimated ") + "trie nodes in same data block ===");
+    if (blockNum > 0) {
+      System.out.println("Block #" + blockNum + " of " + totalBlocks);
+    }
+    System.out.println("Total keys in block: " + blockKeys.size());
+    System.out.println();
+
+    // Storage trie keys: keccak256(address) || location
+    // Group by account hash (first 32 bytes)
+    Map<String, List<byte[]>> byAccount = new HashMap<>();
+    for (byte[] key : blockKeys) {
+      String accHash = key.length >= ACCOUNT_HASH_LEN
+          ? HEX.formatHex(key, 0, ACCOUNT_HASH_LEN) : "(short)";
+      byAccount.computeIfAbsent(accHash, k -> new ArrayList<>()).add(key);
+    }
+
+    String targetAccHash = targetKey.length >= ACCOUNT_HASH_LEN
+        ? HEX.formatHex(targetKey, 0, ACCOUNT_HASH_LEN) : "";
+
+    System.out.println(byAccount.size() + " distinct account(s)' trie nodes in this block:");
+    System.out.println();
+
+    for (var entry : byAccount.entrySet()) {
+      String accHash = entry.getKey();
+      List<byte[]> nodes = entry.getValue();
+      boolean isTgt = accHash.equals(targetAccHash);
+      System.out.println("  Account: " + accHash
+          + (isTgt ? " (TARGET - " + nodes.size() + " nodes)" : " (" + nodes.size() + " nodes)"));
+      for (byte[] key : nodes) {
+        boolean isTarget = Arrays.equals(key, targetKey);
+        String loc = key.length > ACCOUNT_HASH_LEN
+            ? HEX.formatHex(key, ACCOUNT_HASH_LEN, key.length) : "(root)";
+        System.out.println(
+            (isTarget ? "    >>> " : "        ") + "location: " + loc
+                + " (depth " + (key.length - ACCOUNT_HASH_LEN) + ")"
+                + (isTarget ? "  <-- TARGET" : ""));
+      }
+      System.out.println();
+    }
+
+    printSummary(blockKeys.size(), exact);
+    return 0;
+  }
+
+  private int formatAccountTrieBlockResult(
+      List<byte[]> blockKeys, byte[] targetKey, long blockNum, long totalBlocks, boolean exact) {
+
+    System.out.println("=== RESULT: " + (exact ? "" : "Estimated ") + "account trie nodes in same data block ===");
+    if (blockNum > 0) {
+      System.out.println("Block #" + blockNum + " of " + totalBlocks);
+    }
+    System.out.println("Total keys in block: " + blockKeys.size());
+    System.out.println();
+
+    for (byte[] key : blockKeys) {
+      boolean isTarget = Arrays.equals(key, targetKey);
+      String loc = key.length > 0 ? HEX.formatHex(key) : "(root)";
+      System.out.println(
+          (isTarget ? ">>> " : "    ") + "location: " + loc
+              + " (depth " + key.length + ")"
+              + (isTarget ? "  <-- TARGET" : ""));
+    }
+    System.out.println();
+
+    printSummary(blockKeys.size(), exact);
+    return 0;
+  }
+
+  private void printSummary(int blockSize, boolean exact) {
+    System.out.println("--- Summary ---");
+    System.out.println(
+        "When Besu reads this key, RocksDB loads the entire ~32KiB data block.");
+    System.out.println("All " + blockSize + " keys above become cached by that single Get().");
+    if (!exact) {
+      System.out.println();
+      System.out.println(
+          "NOTE: Block boundaries are estimated. Use --use-sst-dump for exact results.");
+    }
+  }
+
+  // ========================================================================
+  // Shared utilities
+  // ========================================================================
+
+  private static byte[] parseRawHexKey(String hex) {
+    String cleaned = hex.startsWith("0x") ? hex.substring(2) : hex;
+    return HEX.parseHex(cleaned);
   }
 
   private static byte[] parseAddress(String addr) {
@@ -230,12 +678,8 @@ public class FlatDbSstInspect implements Callable<Integer> {
 
   private static byte[] parseSlotAsUint256(String slotStr) {
     String cleaned = slotStr.startsWith("0x") ? slotStr.substring(2) : slotStr;
-    BigInteger val;
-    if (slotStr.startsWith("0x")) {
-      val = new BigInteger(cleaned, 16);
-    } else {
-      val = new BigInteger(cleaned);
-    }
+    BigInteger val = slotStr.startsWith("0x")
+        ? new BigInteger(cleaned, 16) : new BigInteger(cleaned);
     byte[] raw = val.toByteArray();
     byte[] padded = new byte[32];
     if (raw.length <= 32) {
@@ -253,48 +697,6 @@ public class FlatDbSstInspect implements Callable<Integer> {
     return digest.digest(input);
   }
 
-  // ---- SST file location ----
-
-  private record SstFileInfo(String path, int level, long numEntries, long size) {}
-
-  private SstFileInfo findSstForKey(RocksDB db, byte[] targetKey) throws RocksDBException {
-    List<LiveFileMetaData> allFiles = db.getLiveFilesMetaData();
-
-    List<LiveFileMetaData> cfFiles = new ArrayList<>();
-    for (LiveFileMetaData meta : allFiles) {
-      if (Arrays.equals(meta.columnFamilyName(), ACCOUNT_STORAGE_CF_ID)) {
-        cfFiles.add(meta);
-      }
-    }
-
-    System.out.println(
-        "Found " + cfFiles.size() + " SST files for ACCOUNT_STORAGE_STORAGE CF.");
-
-    List<LiveFileMetaData> candidates = new ArrayList<>();
-    for (LiveFileMetaData meta : cfFiles) {
-      // LiveFileMetaData keys are internal keys (user_key + 8 bytes seq/type).
-      // Extract user key portion for comparison.
-      byte[] smallest = stripInternalKeySuffix(meta.smallestKey());
-      byte[] largest = stripInternalKeySuffix(meta.largestKey());
-      if (compareBytes(targetKey, smallest) >= 0
-          && compareBytes(targetKey, largest) <= 0) {
-        candidates.add(meta);
-      }
-    }
-
-    if (candidates.isEmpty()) {
-      return null;
-    }
-
-    candidates.sort(Comparator.comparingInt(LiveFileMetaData::level));
-    LiveFileMetaData chosen = candidates.get(0);
-    return new SstFileInfo(
-        chosen.path() + chosen.fileName(),
-        chosen.level(),
-        chosen.numEntries(),
-        chosen.size());
-  }
-
   private static byte[] stripInternalKeySuffix(byte[] internalKey) {
     if (internalKey.length > 8) {
       return Arrays.copyOf(internalKey, internalKey.length - 8);
@@ -309,312 +711,6 @@ public class FlatDbSstInspect implements Callable<Integer> {
       if (cmp != 0) return cmp;
     }
     return Integer.compare(a.length, b.length);
-  }
-
-  // ---- Approach 1: SstFileReader (no external dependency) ----
-
-  private int inspectBlockViaSstFileReader(String sstFilePath, byte[] targetKey)
-      throws RocksDBException {
-    System.out.println("Using SstFileReader to inspect block contents...");
-    System.out.println();
-
-    try (Options options = new Options();
-        SstFileReader reader = new SstFileReader(options)) {
-
-      reader.open(sstFilePath);
-      TableProperties props = reader.getTableProperties();
-
-      long numDataBlocks = props.getNumDataBlocks();
-      long numEntries = props.getNumEntries();
-      long dataSize = props.getDataSize();
-
-      long entriesPerBlock =
-          numDataBlocks > 0 ? Math.max(1, numEntries / numDataBlocks) : numEntries;
-      long avgBlockSize = numDataBlocks > 0 ? dataSize / numDataBlocks : dataSize;
-
-      System.out.println("SST properties:");
-      System.out.println("  data blocks  : " + numDataBlocks);
-      System.out.println("  total entries: " + numEntries);
-      System.out.println("  data size    : " + formatSize(dataSize));
-      System.out.println("  avg block sz : " + formatSize(avgBlockSize));
-      System.out.println("  entries/block: ~" + entriesPerBlock);
-      System.out.println();
-
-      // SstFileReaderIterator.key() returns USER keys (no 8-byte internal suffix).
-      // This is because SstFileReader wraps the internal iterator in a DBIterator.
-      try (ReadOptions readOptions = new ReadOptions();
-          SstFileReaderIterator iter = reader.newIterator(readOptions)) {
-
-        // Find the target's ordinal position in this SST
-        iter.seekToFirst();
-        long position = 0;
-        boolean foundInFile = false;
-        while (iter.isValid()) {
-          byte[] userKey = iter.key();
-          if (Arrays.equals(userKey, targetKey)) {
-            foundInFile = true;
-            break;
-          }
-          if (compareBytes(userKey, targetKey) > 0) {
-            break;
-          }
-          position++;
-          iter.next();
-        }
-
-        if (!foundInFile) {
-          System.out.println(
-              "Target key not physically present in this SST (may be in a higher LSM level).");
-          System.out.println("Showing the estimated block region around insertion point (position ~" + position + ").");
-          System.out.println();
-        } else {
-          long blockIndex = position / entriesPerBlock;
-          System.out.println(
-              "Target found at position "
-                  + position
-                  + " in SST → estimated block #"
-                  + (blockIndex + 1)
-                  + " of "
-                  + numDataBlocks);
-          System.out.println();
-        }
-
-        // Compute the block range: which entries belong to the same block
-        long blockIndex = position / entriesPerBlock;
-        long blockStart = blockIndex * entriesPerBlock;
-        long blockEnd = Math.min(blockStart + entriesPerBlock, numEntries);
-
-        // Collect all keys in this estimated block range
-        iter.seekToFirst();
-        long idx = 0;
-        // Skip to blockStart
-        while (iter.isValid() && idx < blockStart) {
-          idx++;
-          iter.next();
-        }
-        List<byte[]> blockKeys = new ArrayList<>();
-        while (iter.isValid() && idx < blockEnd) {
-          blockKeys.add(iter.key());
-          idx++;
-          iter.next();
-        }
-
-        return printBlockResult(blockKeys, targetKey, blockIndex + 1, numDataBlocks, foundInFile);
-      }
-    }
-  }
-
-  private int printBlockResult(
-      List<byte[]> blockKeys,
-      byte[] targetKey,
-      long blockNum,
-      long totalBlocks,
-      boolean exactMatch) {
-
-    System.out.println("=== RESULT: " + (exactMatch ? "Keys" : "Estimated keys")
-        + " in the same data block as target ===");
-    System.out.println("Estimated block #" + blockNum + " of " + totalBlocks);
-    System.out.println("Total keys in block: " + blockKeys.size());
-    System.out.println();
-
-    // Group keys by account hash to show structure
-    Map<String, List<byte[]>> byAccount = new HashMap<>();
-    for (byte[] key : blockKeys) {
-      String accHash = key.length >= ACCOUNT_HASH_LEN
-          ? HEX.formatHex(key, 0, ACCOUNT_HASH_LEN)
-          : HEX.formatHex(key);
-      byAccount.computeIfAbsent(accHash, k -> new ArrayList<>()).add(key);
-    }
-
-    String targetAccHash = HEX.formatHex(targetKey, 0, ACCOUNT_HASH_LEN);
-
-    System.out.println("Keys grouped by account (contract):");
-    System.out.println(
-        "  " + byAccount.size() + " distinct account(s) in this block");
-    System.out.println();
-
-    // Print keys, grouped by account, target account first
-    List<String> accountHashes = new ArrayList<>(byAccount.keySet());
-    accountHashes.sort((a, b) -> {
-      if (a.equals(targetAccHash)) return -1;
-      if (b.equals(targetAccHash)) return 1;
-      return a.compareTo(b);
-    });
-
-    for (String accHash : accountHashes) {
-      List<byte[]> slots = byAccount.get(accHash);
-      boolean isTargetAccount = accHash.equals(targetAccHash);
-      String label = isTargetAccount
-          ? " (TARGET CONTRACT - " + slots.size() + " slots)"
-          : " (" + slots.size() + " slots)";
-      System.out.println("  Account hash: " + accHash + label);
-
-      for (byte[] key : slots) {
-        boolean isTarget = Arrays.equals(key, targetKey);
-        String slotHash = key.length == FLAT_KEY_LEN
-            ? HEX.formatHex(key, ACCOUNT_HASH_LEN, FLAT_KEY_LEN)
-            : "(unexpected key length: " + key.length + " bytes)";
-
-        if (isTarget) {
-          System.out.println("    >>> slot_hash: " + slotHash + "  <-- TARGET SLOT");
-        } else {
-          System.out.println("        slot_hash: " + slotHash);
-        }
-      }
-      System.out.println();
-    }
-
-    System.out.println("--- Summary ---");
-    System.out.println("Total keys in block: " + blockKeys.size());
-    System.out.println("Distinct accounts:   " + byAccount.size());
-    int sameAccountCount = byAccount.getOrDefault(targetAccHash, List.of()).size();
-    System.out.println("Slots for target contract in this block: " + sameAccountCount);
-    System.out.println();
-    System.out.println(
-        "When Besu reads this storage slot, RocksDB loads the entire ~32KiB data");
-    System.out.println(
-        "block into the block cache. All " + blockKeys.size() + " keys above become cached.");
-    if (!exactMatch) {
-      System.out.println();
-      System.out.println(
-          "NOTE: Block boundaries are estimated from SST metadata (entries/blocks).");
-      System.out.println("For exact boundaries, re-run with --use-sst-dump and sst_dump on PATH.");
-    }
-
-    return 0;
-  }
-
-  private void printKeys(List<byte[]> keys, byte[] targetKey) {
-    for (byte[] key : keys) {
-      boolean isTarget = Arrays.equals(key, targetKey);
-      String keyHex = HEX.formatHex(key);
-      String marker = isTarget ? " <-- TARGET" : "";
-
-      if (key.length == FLAT_KEY_LEN) {
-        String accHash = keyHex.substring(0, 64);
-        String slotHash = keyHex.substring(64, 128);
-        System.out.println((isTarget ? ">>> " : "    ") + keyHex + marker);
-        System.out.println("        account_hash=" + accHash + " slot_hash=" + slotHash);
-      } else {
-        System.out.println((isTarget ? ">>> " : "    ") + keyHex + marker);
-      }
-    }
-  }
-
-  // ---- Approach 2: external sst_dump (exact block boundaries) ----
-
-  private int dumpAndParseBlocksViaSstDump(String sstFilePath, byte[] targetKey)
-      throws IOException, InterruptedException {
-    Path tempFile = Files.createTempFile("sst_raw_dump_", ".txt");
-    try {
-      System.out.println("Running sst_dump --command=raw on " + sstFilePath + " ...");
-      System.out.println("(This may take a while for large SST files)");
-      System.out.println();
-
-      ProcessBuilder pb =
-          new ProcessBuilder(sstDumpPath, "--file=" + sstFilePath, "--command=raw");
-      pb.redirectOutput(tempFile.toFile());
-      pb.redirectErrorStream(true);
-      Process proc = pb.start();
-      int exitCode = proc.waitFor();
-
-      if (exitCode != 0) {
-        System.err.println("sst_dump exited with code " + exitCode);
-        System.err.println("Output:");
-        Files.lines(tempFile).limit(50).forEach(System.err::println);
-        System.err.println();
-        System.err.println(
-            "Make sure sst_dump (RocksDB 9.7.x) is installed and on your PATH,");
-        System.err.println("or pass --sst-dump-path=/path/to/sst_dump");
-        return 1;
-      }
-
-      return parseRawDump(tempFile, targetKey);
-    } finally {
-      Files.deleteIfExists(tempFile);
-    }
-  }
-
-  private int parseRawDump(Path dumpFile, byte[] targetKey) throws IOException {
-    String targetHex = HEX.formatHex(targetKey).toUpperCase();
-
-    List<String> currentBlockKeys = new ArrayList<>();
-    String currentBlockHeader = null;
-    boolean foundTarget = false;
-    String matchedBlockHeader = null;
-    List<String> matchedBlockKeys = null;
-
-    int totalBlocks = 0;
-    int totalKeys = 0;
-
-    try (BufferedReader reader = Files.newBufferedReader(dumpFile)) {
-      String line;
-      while ((line = reader.readLine()) != null) {
-        if (line.startsWith("Data Block #")) {
-          if (foundTarget && matchedBlockKeys == null) {
-            matchedBlockKeys = new ArrayList<>(currentBlockKeys);
-            matchedBlockHeader = currentBlockHeader;
-          }
-          totalBlocks++;
-          currentBlockKeys.clear();
-          currentBlockHeader = line.trim();
-          foundTarget = false;
-          continue;
-        }
-
-        if (line.startsWith("  HEX ") || line.startsWith(" HEX ")) {
-          String trimmed = line.trim();
-          if (trimmed.startsWith("HEX ")) {
-            String rest = trimmed.substring(4);
-            int colonIdx = rest.indexOf(':');
-            if (colonIdx > 0) {
-              String keyHex = rest.substring(0, colonIdx).trim().toUpperCase();
-              // sst_dump shows internal keys: user_key + 8 bytes (seq+type) = +16 hex chars
-              String userKeyHex = keyHex;
-              if (keyHex.length() > 16) {
-                userKeyHex = keyHex.substring(0, keyHex.length() - 16);
-              }
-              currentBlockKeys.add(userKeyHex);
-              totalKeys++;
-              if (userKeyHex.equalsIgnoreCase(targetHex)) {
-                foundTarget = true;
-              }
-            }
-          }
-        }
-      }
-
-      if (foundTarget && matchedBlockKeys == null) {
-        matchedBlockKeys = new ArrayList<>(currentBlockKeys);
-        matchedBlockHeader = currentBlockHeader;
-      }
-    }
-
-    System.out.println(
-        "SST file stats: " + totalBlocks + " data blocks, " + totalKeys + " total keys");
-    System.out.println();
-
-    if (matchedBlockKeys == null) {
-      System.err.println(
-          "WARNING: Target key was not found in any data block of this SST file.");
-      return 1;
-    }
-
-    System.out.println("=== RESULT: Keys in the same data block as target (EXACT) ===");
-    System.out.println("Block: " + matchedBlockHeader);
-    System.out.println("Total keys in block: " + matchedBlockKeys.size());
-    System.out.println();
-
-    // Convert hex strings to byte arrays and use the nice grouped output
-    List<byte[]> blockKeyBytes = new ArrayList<>();
-    for (String kh : matchedBlockKeys) {
-      try {
-        blockKeyBytes.add(HEX.parseHex(kh.toLowerCase()));
-      } catch (Exception e) {
-        blockKeyBytes.add(new byte[0]);
-      }
-    }
-    return printBlockResult(blockKeyBytes, targetKey, -1, totalBlocks, true);
   }
 
   private static String formatSize(long bytes) {
