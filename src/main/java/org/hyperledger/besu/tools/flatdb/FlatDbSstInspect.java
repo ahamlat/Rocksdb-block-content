@@ -16,6 +16,8 @@ import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
@@ -252,8 +254,11 @@ public class FlatDbSstInspect implements Callable<Integer> {
 
   private enum ReadStatus { CACHE_HIT, CACHE_MISS, MEMTABLE, NOT_FOUND }
 
+  private record ParsedKey(byte[] flatKey, String address, String originalSlot) {}
+
   private record BatchKeyResult(
-      byte[] key, ReadStatus status, int valueLen, int neighborsInInput, int neighborsTotal) {}
+      byte[] key, ReadStatus status, int valueLen, int neighborsInInput, int neighborsTotal,
+      String address, String originalSlot) {}
 
   private int runBatchMode() throws Exception {
     if (inputFile == null) {
@@ -261,30 +266,30 @@ public class FlatDbSstInspect implements Callable<Integer> {
       return 1;
     }
 
-    List<byte[]> keys = parseInputFile(inputFile.toPath());
-    if (keys.isEmpty()) {
+    List<ParsedKey> parsedKeys = parseInputFile(inputFile.toPath());
+    if (parsedKeys.isEmpty()) {
       System.err.println("ERROR: No keys parsed from input file.");
       return 1;
     }
 
     Set<ByteArrayKey> keySet = new HashSet<>();
-    for (byte[] k : keys) {
-      keySet.add(new ByteArrayKey(k));
+    for (ParsedKey pk : parsedKeys) {
+      keySet.add(new ByteArrayKey(pk.flatKey));
     }
 
     // deduplicate while preserving order
-    List<byte[]> uniqueKeys = new ArrayList<>();
+    List<ParsedKey> uniqueParsed = new ArrayList<>();
     Set<ByteArrayKey> seen = new LinkedHashSet<>();
-    for (byte[] k : keys) {
-      if (seen.add(new ByteArrayKey(k))) {
-        uniqueKeys.add(k);
+    for (ParsedKey pk : parsedKeys) {
+      if (seen.add(new ByteArrayKey(pk.flatKey))) {
+        uniqueParsed.add(pk);
       }
     }
 
     System.out.println("=== Besu SST Block Inspector — BATCH mode ===");
     System.out.println("Input file: " + inputFile.getAbsolutePath());
-    System.out.println("Total lines: " + keys.size());
-    System.out.println("Unique keys: " + uniqueKeys.size());
+    System.out.println("Total lines: " + parsedKeys.size());
+    System.out.println("Unique keys: " + uniqueParsed.size());
     System.out.println("Column family: ACCOUNT_STORAGE_STORAGE (0x08)");
     System.out.println();
 
@@ -323,7 +328,7 @@ public class FlatDbSstInspect implements Callable<Integer> {
           return 1;
         }
 
-        System.out.println("Column family found. Reading " + uniqueKeys.size() + " keys sequentially...");
+        System.out.println("Column family found. Reading " + uniqueParsed.size() + " keys sequentially...");
         System.out.println();
 
         List<BatchKeyResult> results = new ArrayList<>();
@@ -332,8 +337,9 @@ public class FlatDbSstInspect implements Callable<Integer> {
         int hitCount = 0, missCount = 0, memCount = 0, notFoundCount = 0;
 
         try (ReadOptions ro = new ReadOptions()) {
-          for (int i = 0; i < uniqueKeys.size(); i++) {
-            byte[] key = uniqueKeys.get(i);
+          for (int i = 0; i < uniqueParsed.size(); i++) {
+            ParsedKey pk = uniqueParsed.get(i);
+            byte[] key = pk.flatKey;
             resetAllCacheCounters(stats);
 
             byte[] value = db.get(cfHandle, ro, key);
@@ -359,15 +365,29 @@ public class FlatDbSstInspect implements Callable<Integer> {
             }
 
             results.add(new BatchKeyResult(
-                key, status, value != null ? value.length : 0, -1, -1));
+                key, status, value != null ? value.length : 0, -1, -1,
+                pk.address, pk.originalSlot));
 
-            String accHash = HEX.formatHex(key, 0, Math.min(ACCOUNT_HASH_LEN, key.length));
-            String slotHash = key.length == FLAT_KEY_LEN
-                ? HEX.formatHex(key, ACCOUNT_HASH_LEN, FLAT_KEY_LEN) : "?";
+            // Build display: show original address+slot if available, else hashes
+            String display;
+            if (pk.address != null) {
+              String shortAddr = pk.address.length() > 12
+                  ? pk.address.substring(0, 12) + "..." : pk.address;
+              String shortSlot = pk.originalSlot != null
+                  ? (pk.originalSlot.length() > 12
+                      ? pk.originalSlot.substring(0, 12) + "..." : pk.originalSlot)
+                  : "?";
+              display = String.format("addr:%s slot:%s", shortAddr, shortSlot);
+            } else {
+              String accHash = HEX.formatHex(key, 0, Math.min(ACCOUNT_HASH_LEN, key.length));
+              String slotHash = key.length == FLAT_KEY_LEN
+                  ? HEX.formatHex(key, ACCOUNT_HASH_LEN, FLAT_KEY_LEN) : "?";
+              display = String.format("accHash:%s... slot:%s...",
+                  accHash.substring(0, Math.min(16, accHash.length())),
+                  slotHash.substring(0, Math.min(16, slotHash.length())));
+            }
 
-            System.out.printf("[%4d] %-10s accHash:%s slot:%s",
-                i + 1, status, accHash.substring(0, Math.min(16, accHash.length())) + "...",
-                slotHash.substring(0, Math.min(16, slotHash.length())) + "...");
+            System.out.printf("[%4d] %-10s %s", i + 1, status, display);
             if (value != null) {
               System.out.printf(" value:%dB", value.length);
             }
@@ -414,7 +434,7 @@ public class FlatDbSstInspect implements Callable<Integer> {
         System.out.println("=== BATCH CACHE ANALYSIS SUMMARY ===");
         System.out.println();
 
-        int total = uniqueKeys.size();
+        int total = uniqueParsed.size();
         int found = total - notFoundCount;
 
         System.out.println("Input keys      : " + total);
@@ -455,31 +475,53 @@ public class FlatDbSstInspect implements Callable<Integer> {
     }
   }
 
-  private List<byte[]> parseInputFile(Path path) throws IOException {
-    List<byte[]> keys = new ArrayList<>();
+  private static final Pattern KEY_PATTERN =
+      Pattern.compile("key\\s*:\\s*(0x[0-9a-fA-F]{64})\\s+(0x[0-9a-fA-F]{64})");
+  private static final Pattern ACCOUNT_PATTERN =
+      Pattern.compile("Account\\s+(0x[0-9a-fA-F]{40})");
+  private static final Pattern SLOT_PATTERN =
+      Pattern.compile("storageSlotKey\\s+Optional\\[(0x[0-9a-fA-F]+)]");
+
+  private List<ParsedKey> parseInputFile(Path path) throws IOException {
+    List<ParsedKey> keys = new ArrayList<>();
     try (BufferedReader reader = Files.newBufferedReader(path, StandardCharsets.UTF_8)) {
       String line;
       while ((line = reader.readLine()) != null) {
-        line = line.trim();
         if (line.isEmpty()) continue;
 
-        // Format: "key : 0x<accHash> 0x<slotHash>"
-        if (line.startsWith("key")) {
-          int colonIdx = line.indexOf(':');
-          if (colonIdx < 0) continue;
-          String rest = line.substring(colonIdx + 1).trim();
-          String[] parts = rest.split("\\s+");
-          if (parts.length >= 2) {
-            String accHex = parts[0].startsWith("0x") ? parts[0].substring(2) : parts[0];
-            String slotHex = parts[1].startsWith("0x") ? parts[1].substring(2) : parts[1];
+        // Extract "key : 0x<accHash> 0x<slotHash>" from anywhere in the line
+        Matcher keyMatcher = KEY_PATTERN.matcher(line);
+        while (keyMatcher.find()) {
+          String accHex = keyMatcher.group(1).substring(2);
+          String slotHex = keyMatcher.group(2).substring(2);
+          try {
             byte[] accHash = HEX.parseHex(accHex);
             byte[] slotHash = HEX.parseHex(slotHex);
             if (accHash.length == ACCOUNT_HASH_LEN && slotHash.length == ACCOUNT_HASH_LEN) {
               byte[] key = new byte[FLAT_KEY_LEN];
               System.arraycopy(accHash, 0, key, 0, ACCOUNT_HASH_LEN);
               System.arraycopy(slotHash, 0, key, ACCOUNT_HASH_LEN, ACCOUNT_HASH_LEN);
-              keys.add(key);
+
+              // Try to extract Account address and original slot from context before this key
+              String before = line.substring(0, keyMatcher.start());
+              String address = null;
+              String originalSlot = null;
+
+              // Find the LAST Account + storageSlotKey before this key occurrence
+              Matcher accMatcher = ACCOUNT_PATTERN.matcher(before);
+              String lastAddr = null;
+              while (accMatcher.find()) lastAddr = accMatcher.group(1);
+              address = lastAddr;
+
+              Matcher slotMatcher = SLOT_PATTERN.matcher(before);
+              String lastSlot = null;
+              while (slotMatcher.find()) lastSlot = slotMatcher.group(1);
+              originalSlot = lastSlot;
+
+              keys.add(new ParsedKey(key, address, originalSlot));
             }
+          } catch (Exception e) {
+            // skip malformed
           }
         }
       }
