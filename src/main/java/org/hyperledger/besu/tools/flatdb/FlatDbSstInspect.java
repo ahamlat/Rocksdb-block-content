@@ -497,9 +497,9 @@ public class FlatDbSstInspect implements Callable<Integer> {
           return Integer.compare(totalB, totalA);
         });
 
-        System.out.printf("%-44s %6s %6s %6s %6s %8s %8s %8s %8s%n",
+        System.out.printf("%-68s %6s %6s %6s %6s %8s %8s %8s %8s%n",
             "Account", "HIT", "MISS", "MEMTBL", "NOTFND", "TOTAL", "HIT%", "MISS%", "NOTFND%");
-        System.out.println("-".repeat(140));
+        System.out.println("-".repeat(160));
 
         for (var entry : sortedAccounts) {
           String accHash = entry.getKey();
@@ -510,17 +510,19 @@ public class FlatDbSstInspect implements Callable<Integer> {
           double acctNotFoundPct = acctTotal > 0 ? c[3] * 100.0 / acctTotal : 0;
 
           String addr = accountToAddress.get(accHash);
-          String label = addr != null ? addr : accHash;
+          String label = addr != null
+              ? addr + " (" + accHash.substring(0, 16) + "...)"
+              : accHash;
 
-          System.out.printf("%-44s %6d %6d %6d %6d %8d %7.1f%% %7.1f%% %7.1f%%%n",
+          System.out.printf("%-68s %6d %6d %6d %6d %8d %7.1f%% %7.1f%% %7.1f%%%n",
               label, c[0], c[1], c[2], c[3], acctTotal, acctHitPct, acctMissPct, acctNotFoundPct);
         }
 
-        System.out.println("-".repeat(140));
+        System.out.println("-".repeat(160));
         double totalHitPct = total > 0 ? hitCount * 100.0 / total : 0;
         double totalMissPct = total > 0 ? missCount * 100.0 / total : 0;
         double totalNotFoundPct = total > 0 ? notFoundCount * 100.0 / total : 0;
-        System.out.printf("%-44s %6d %6d %6d %6d %8d %7.1f%% %7.1f%% %7.1f%%%n",
+        System.out.printf("%-68s %6d %6d %6d %6d %8d %7.1f%% %7.1f%% %7.1f%%%n",
             "TOTAL", hitCount, missCount, memCount, notFoundCount, total,
             totalHitPct, totalMissPct, totalNotFoundPct);
 
