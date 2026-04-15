@@ -520,11 +520,21 @@ public class FlatDbSstInspect implements Callable<Integer> {
         // Resolve contract names via Etherscan if API key provided
         Map<String, String> contractNames = new HashMap<>();
         if (etherscanApiKey != null) {
-          Set<String> addresses = new HashSet<>(accountToAddress.values());
+          Set<String> addresses = new LinkedHashSet<>(accountToAddress.values());
+          System.out.printf("%nResolving %d contract names via Etherscan...%n", addresses.size());
+          int resolved = 0;
           for (String addr : addresses) {
             String name = lookupContractName(addr, etherscanApiKey);
-            if (name != null) contractNames.put(addr.toLowerCase(), name);
+            if (name != null) {
+              contractNames.put(addr.toLowerCase(), name);
+              resolved++;
+              System.out.printf("  %s -> %s%n", addr, name);
+            } else {
+              System.out.printf("  %s -> (unknown)%n", addr);
+            }
+            try { Thread.sleep(210); } catch (InterruptedException ignored) {}
           }
+          System.out.printf("Resolved %d / %d contract names.%n%n", resolved, addresses.size());
         }
 
         System.out.printf("%-90s %8s %6s %6s %6s %6s %8s %8s %8s%n",
@@ -592,13 +602,17 @@ public class FlatDbSstInspect implements Callable<Integer> {
 
   private static String lookupContractName(String address, String apiKey) {
     try {
-      String url = "https://api.etherscan.io/api?module=contract&action=getsourcecode&address="
+      String url = "https://api.etherscan.io/v2/api?chainid=1&module=contract&action=getsourcecode&address="
           + address + "&apikey=" + apiKey;
       HttpURLConnection conn = (HttpURLConnection) URI.create(url).toURL().openConnection();
       conn.setRequestMethod("GET");
-      conn.setConnectTimeout(5000);
-      conn.setReadTimeout(5000);
-      if (conn.getResponseCode() != 200) return null;
+      conn.setConnectTimeout(10000);
+      conn.setReadTimeout(10000);
+      int code = conn.getResponseCode();
+      if (code != 200) {
+        System.err.printf("    Etherscan HTTP %d for %s%n", code, address);
+        return null;
+      }
 
       StringBuilder sb = new StringBuilder();
       try (var reader = new BufferedReader(new InputStreamReader(conn.getInputStream(), StandardCharsets.UTF_8))) {
@@ -606,7 +620,14 @@ public class FlatDbSstInspect implements Callable<Integer> {
         while ((line = reader.readLine()) != null) sb.append(line);
       }
       String json = sb.toString();
-      // Simple JSON extraction for "ContractName":"..."
+
+      // Check API-level status
+      if (json.contains("\"status\":\"0\"") && json.contains("rate limit")) {
+        System.err.println("    Etherscan rate limit hit, waiting 1s...");
+        try { Thread.sleep(1000); } catch (InterruptedException ignored) {}
+        return lookupContractName(address, apiKey);
+      }
+
       int idx = json.indexOf("\"ContractName\":\"");
       if (idx < 0) return null;
       int start = idx + "\"ContractName\":\"".length();
@@ -615,6 +636,7 @@ public class FlatDbSstInspect implements Callable<Integer> {
       String name = json.substring(start, end).trim();
       return name.isEmpty() ? null : name;
     } catch (Exception e) {
+      System.err.printf("    Etherscan error for %s: %s%n", address, e.getMessage());
       return null;
     }
   }
