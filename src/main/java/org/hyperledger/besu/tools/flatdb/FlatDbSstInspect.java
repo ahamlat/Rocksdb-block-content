@@ -377,9 +377,10 @@ public class FlatDbSstInspect implements Callable<Integer> {
                 pk.address, pk.originalSlot));
 
             String display;
-            if (pk.address != null) {
+            String verifiedAddr = verifyAddress(pk.address, key);
+            if (verifiedAddr != null) {
               String slotStr = pk.originalSlot != null ? pk.originalSlot : "?";
-              display = String.format("addr:%s slot:%s", pk.address, slotStr);
+              display = String.format("addr:%s slot:%s", verifiedAddr, slotStr);
             } else {
               String accHash = HEX.formatHex(key, 0, Math.min(ACCOUNT_HASH_LEN, key.length));
               String slotHash = key.length == FLAT_KEY_LEN
@@ -485,8 +486,17 @@ public class FlatDbSstInspect implements Callable<Integer> {
             case MEMTABLE -> counts[2]++;
             case NOT_FOUND -> counts[3]++;
           }
-          if (r.address != null) {
-            accountToAddress.putIfAbsent(accHash, r.address);
+          if (r.address != null && !accountToAddress.containsKey(accHash)) {
+            String addrClean = r.address.startsWith("0x") ? r.address.substring(2) : r.address;
+            try {
+              byte[] addrBytes = HEX.parseHex(addrClean);
+              if (addrBytes.length == 20) {
+                String computedHash = HEX.formatHex(keccak256(addrBytes));
+                if (computedHash.equals(accHash)) {
+                  accountToAddress.put(accHash, r.address);
+                }
+              }
+            } catch (Exception ignored) {}
           }
         }
 
@@ -536,6 +546,21 @@ public class FlatDbSstInspect implements Callable<Integer> {
     } finally {
       stats.close();
       lruCache.close();
+    }
+  }
+
+  private static String verifyAddress(String address, byte[] flatKey) {
+    if (address == null || flatKey.length < ACCOUNT_HASH_LEN) return null;
+    String addrClean = address.startsWith("0x") ? address.substring(2) : address;
+    try {
+      byte[] addrBytes = HEX.parseHex(addrClean);
+      if (addrBytes.length != 20) return null;
+      byte[] computed = keccak256(addrBytes);
+      String computedHex = HEX.formatHex(computed);
+      String keyAccHash = HEX.formatHex(flatKey, 0, ACCOUNT_HASH_LEN);
+      return computedHex.equals(keyAccHash) ? address : null;
+    } catch (Exception e) {
+      return null;
     }
   }
 
