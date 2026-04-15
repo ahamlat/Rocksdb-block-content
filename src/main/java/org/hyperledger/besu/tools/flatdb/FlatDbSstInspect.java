@@ -368,23 +368,15 @@ public class FlatDbSstInspect implements Callable<Integer> {
                 key, status, value != null ? value.length : 0, -1, -1,
                 pk.address, pk.originalSlot));
 
-            // Build display: show original address+slot if available, else hashes
             String display;
             if (pk.address != null) {
-              String shortAddr = pk.address.length() > 12
-                  ? pk.address.substring(0, 12) + "..." : pk.address;
-              String shortSlot = pk.originalSlot != null
-                  ? (pk.originalSlot.length() > 12
-                      ? pk.originalSlot.substring(0, 12) + "..." : pk.originalSlot)
-                  : "?";
-              display = String.format("addr:%s slot:%s", shortAddr, shortSlot);
+              String slotStr = pk.originalSlot != null ? pk.originalSlot : "?";
+              display = String.format("addr:%s slot:%s", pk.address, slotStr);
             } else {
               String accHash = HEX.formatHex(key, 0, Math.min(ACCOUNT_HASH_LEN, key.length));
               String slotHash = key.length == FLAT_KEY_LEN
                   ? HEX.formatHex(key, ACCOUNT_HASH_LEN, FLAT_KEY_LEN) : "?";
-              display = String.format("accHash:%s... slot:%s...",
-                  accHash.substring(0, Math.min(16, accHash.length())),
-                  slotHash.substring(0, Math.min(16, slotHash.length())));
+              display = String.format("accHash:%s slot:%s", accHash, slotHash);
             }
 
             System.out.printf("[%4d] %-10s %s", i + 1, status, display);
@@ -424,9 +416,10 @@ public class FlatDbSstInspect implements Callable<Integer> {
           analyzedMisses++;
 
           String accHash = HEX.formatHex(missKey, 0, Math.min(ACCOUNT_HASH_LEN, missKey.length));
-          System.out.printf("  MISS accHash:%s  neighbors_in_input: %d / %d%n",
-              accHash.substring(0, Math.min(16, accHash.length())) + "...",
-              neighborsInInput, blockKeys.size());
+          String slotHash = missKey.length == FLAT_KEY_LEN
+              ? HEX.formatHex(missKey, ACCOUNT_HASH_LEN, FLAT_KEY_LEN) : "?";
+          System.out.printf("  MISS accHash:%s slot:%s  neighbors_in_input: %d / %d%n",
+              accHash, slotHash, neighborsInInput, blockKeys.size());
         }
 
         // Print summary
