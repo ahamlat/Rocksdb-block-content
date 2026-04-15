@@ -135,6 +135,14 @@ public class FlatDbSstInspect implements Callable<Integer> {
           "After identifying block neighbors, read target then all neighbors and verify they are served from block cache")
   private boolean verify = false;
 
+  // ---- Sort options ----
+
+  @Option(
+      names = {"--sort-by"},
+      description = "Sort per-account table by: 'total' (default), 'notfound', 'miss', 'hit'",
+      defaultValue = "total")
+  private String sortBy;
+
   // ---- Etherscan options ----
 
   @Option(
@@ -511,10 +519,17 @@ public class FlatDbSstInspect implements Callable<Integer> {
         }
 
         List<Map.Entry<String, int[]>> sortedAccounts = new ArrayList<>(accountCounters.entrySet());
+        // counts array: [0]=HIT, [1]=MISS, [2]=MEMTABLE, [3]=NOTFOUND
         sortedAccounts.sort((a, b) -> {
-          int totalA = a.getValue()[0] + a.getValue()[1] + a.getValue()[2] + a.getValue()[3];
-          int totalB = b.getValue()[0] + b.getValue()[1] + b.getValue()[2] + b.getValue()[3];
-          return Integer.compare(totalB, totalA);
+          int[] ca = a.getValue(), cb = b.getValue();
+          int va, vb;
+          switch (sortBy.toLowerCase()) {
+            case "notfound" -> { va = ca[3]; vb = cb[3]; }
+            case "miss"     -> { va = ca[1]; vb = cb[1]; }
+            case "hit"      -> { va = ca[0]; vb = cb[0]; }
+            default         -> { va = ca[0]+ca[1]+ca[2]+ca[3]; vb = cb[0]+cb[1]+cb[2]+cb[3]; }
+          }
+          return Integer.compare(vb, va);
         });
 
         // Resolve contract names via Etherscan if API key provided
