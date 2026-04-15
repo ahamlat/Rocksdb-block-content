@@ -127,6 +127,11 @@ public class FlatDbSstInspect implements Callable<Integer> {
       description = "Ethereum block number (for display purposes)")
   private String blockNumber;
 
+  @Option(
+      names = {"--filter-address"},
+      description = "Only show results for this contract address (batch mode)")
+  private String filterAddress;
+
   // ---- Verification options ----
 
   @Option(
@@ -307,6 +312,27 @@ public class FlatDbSstInspect implements Callable<Integer> {
       if (seen.add(new ByteArrayKey(pk.flatKey))) {
         uniqueParsed.add(pk);
       }
+    }
+
+    // filter by address if requested
+    byte[] filterAccHash = null;
+    if (filterAddress != null) {
+      String addrClean = filterAddress.startsWith("0x") ? filterAddress.substring(2) : filterAddress;
+      filterAccHash = keccak256(HEX.parseHex(addrClean));
+      byte[] fHash = filterAccHash;
+      int beforeFilter = uniqueParsed.size();
+      uniqueParsed.removeIf(pk -> {
+        if (pk.flatKey.length < ACCOUNT_HASH_LEN) return true;
+        for (int j = 0; j < ACCOUNT_HASH_LEN; j++) {
+          if (pk.flatKey[j] != fHash[j]) return true;
+        }
+        return false;
+      });
+      // also update keySet to only contain filtered keys
+      keySet.clear();
+      for (ParsedKey pk : uniqueParsed) keySet.add(new ByteArrayKey(pk.flatKey));
+      System.out.println("Filter: " + filterAddress + " (accHash: " + HEX.formatHex(filterAccHash) + ")");
+      System.out.println("Filtered: " + uniqueParsed.size() + " / " + beforeFilter + " unique keys match");
     }
 
     System.out.println("=== Besu SST Block Inspector — BATCH mode ===");
