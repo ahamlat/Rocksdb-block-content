@@ -119,6 +119,11 @@ public class FlatDbSstInspect implements Callable<Integer> {
       description = "File containing flat keys to replay (one per line, format: 'key : 0x<accHash> 0x<slotHash>')")
   private File inputFile;
 
+  @Option(
+      names = {"--block-number"},
+      description = "Ethereum block number (for display purposes)")
+  private String blockNumber;
+
   // ---- Verification options ----
 
   @Option(
@@ -287,6 +292,9 @@ public class FlatDbSstInspect implements Callable<Integer> {
     }
 
     System.out.println("=== Besu SST Block Inspector — BATCH mode ===");
+    if (blockNumber != null) {
+      System.out.println("Ethereum block: " + blockNumber);
+    }
     System.out.println("Input file: " + inputFile.getAbsolutePath());
     System.out.println("Total lines: " + parsedKeys.size());
     System.out.println("Unique keys: " + uniqueParsed.size());
@@ -425,6 +433,9 @@ public class FlatDbSstInspect implements Callable<Integer> {
         // Print summary
         System.out.println();
         System.out.println("=== BATCH CACHE ANALYSIS SUMMARY ===");
+        if (blockNumber != null) {
+          System.out.println("Ethereum block: " + blockNumber);
+        }
         System.out.println();
 
         int total = uniqueParsed.size();
