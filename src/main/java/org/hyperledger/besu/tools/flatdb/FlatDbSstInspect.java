@@ -466,6 +466,59 @@ public class FlatDbSstInspect implements Callable<Integer> {
               avgNeighborsInInput);
         }
 
+        // Per-account breakdown
+        System.out.println();
+        System.out.println("=== PER-ACCOUNT BREAKDOWN ===");
+        System.out.println();
+
+        record AccountStats(String address, int hit, int miss, int memtable, int notFound, int total) {}
+
+        Map<String, int[]> accountCounters = new HashMap<>();
+        Map<String, String> accountToAddress = new HashMap<>();
+
+        for (BatchKeyResult r : results) {
+          String accHash = HEX.formatHex(r.key, 0, Math.min(ACCOUNT_HASH_LEN, r.key.length));
+          int[] counts = accountCounters.computeIfAbsent(accHash, k -> new int[4]);
+          switch (r.status) {
+            case CACHE_HIT -> counts[0]++;
+            case CACHE_MISS -> counts[1]++;
+            case MEMTABLE -> counts[2]++;
+            case NOT_FOUND -> counts[3]++;
+          }
+          if (r.address != null) {
+            accountToAddress.putIfAbsent(accHash, r.address);
+          }
+        }
+
+        List<Map.Entry<String, int[]>> sortedAccounts = new ArrayList<>(accountCounters.entrySet());
+        sortedAccounts.sort((a, b) -> {
+          int totalA = a.getValue()[0] + a.getValue()[1] + a.getValue()[2] + a.getValue()[3];
+          int totalB = b.getValue()[0] + b.getValue()[1] + b.getValue()[2] + b.getValue()[3];
+          return Integer.compare(totalB, totalA);
+        });
+
+        System.out.printf("%-44s %6s %6s %6s %6s %8s %8s%n",
+            "Account", "HIT", "MISS", "MEMTBL", "NOTFND", "TOTAL", "HIT%");
+        System.out.println("-".repeat(120));
+
+        for (var entry : sortedAccounts) {
+          String accHash = entry.getKey();
+          int[] c = entry.getValue();
+          int acctTotal = c[0] + c[1] + c[2] + c[3];
+          int acctFound = c[0] + c[1] + c[2];
+          double acctHitRate = acctFound > 0 ? c[0] * 100.0 / acctFound : 0;
+
+          String addr = accountToAddress.get(accHash);
+          String label = addr != null ? addr : accHash;
+
+          System.out.printf("%-44s %6d %6d %6d %6d %8d %7.1f%%%n",
+              label, c[0], c[1], c[2], c[3], acctTotal, acctHitRate);
+        }
+
+        System.out.println("-".repeat(120));
+        System.out.printf("%-44s %6d %6d %6d %6d %8d%n",
+            "TOTAL", hitCount, missCount, memCount, notFoundCount, total);
+
         return 0;
 
       } finally {
