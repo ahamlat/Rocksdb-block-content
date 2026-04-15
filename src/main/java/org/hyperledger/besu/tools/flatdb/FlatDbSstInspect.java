@@ -12,7 +12,10 @@ package org.hyperledger.besu.tools.flatdb;
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.IOException;
+import java.io.InputStreamReader;
 import java.math.BigInteger;
+import java.net.HttpURLConnection;
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -131,6 +134,13 @@ public class FlatDbSstInspect implements Callable<Integer> {
       description =
           "After identifying block neighbors, read target then all neighbors and verify they are served from block cache")
   private boolean verify = false;
+
+  // ---- Etherscan options ----
+
+  @Option(
+      names = {"--etherscan-api-key"},
+      description = "Etherscan API key to resolve contract names (optional)")
+  private String etherscanApiKey;
 
   // ---- sst_dump options ----
 
@@ -507,9 +517,19 @@ public class FlatDbSstInspect implements Callable<Integer> {
           return Integer.compare(totalB, totalA);
         });
 
-        System.out.printf("%-68s %6s %6s %6s %6s %8s %8s %8s %8s%n",
-            "Account", "HIT", "MISS", "MEMTBL", "NOTFND", "TOTAL", "HIT%", "MISS%", "NOTFND%");
-        System.out.println("-".repeat(160));
+        // Resolve contract names via Etherscan if API key provided
+        Map<String, String> contractNames = new HashMap<>();
+        if (etherscanApiKey != null) {
+          Set<String> addresses = new HashSet<>(accountToAddress.values());
+          for (String addr : addresses) {
+            String name = lookupContractName(addr, etherscanApiKey);
+            if (name != null) contractNames.put(addr.toLowerCase(), name);
+          }
+        }
+
+        System.out.printf("%-90s %8s %6s %6s %6s %6s %8s %8s %8s%n",
+            "Account", "TOTAL", "HIT", "MISS", "MEMTBL", "NOTFND", "HIT%", "MISS%", "NOTFND%");
+        System.out.println("-".repeat(170));
 
         for (var entry : sortedAccounts) {
           String accHash = entry.getKey();
@@ -520,20 +540,26 @@ public class FlatDbSstInspect implements Callable<Integer> {
           double acctNotFoundPct = acctTotal > 0 ? c[3] * 100.0 / acctTotal : 0;
 
           String addr = accountToAddress.get(accHash);
-          String label = addr != null
-              ? addr + " (" + accHash.substring(0, 16) + "...)"
-              : accHash;
+          String label;
+          if (addr != null) {
+            String name = contractNames.get(addr.toLowerCase());
+            label = name != null
+                ? addr + " [" + name + "] (" + accHash.substring(0, 16) + "...)"
+                : addr + " (" + accHash.substring(0, 16) + "...)";
+          } else {
+            label = accHash;
+          }
 
-          System.out.printf("%-68s %6d %6d %6d %6d %8d %7.1f%% %7.1f%% %7.1f%%%n",
-              label, c[0], c[1], c[2], c[3], acctTotal, acctHitPct, acctMissPct, acctNotFoundPct);
+          System.out.printf("%-90s %8d %6d %6d %6d %6d %7.1f%% %7.1f%% %7.1f%%%n",
+              label, acctTotal, c[0], c[1], c[2], c[3], acctHitPct, acctMissPct, acctNotFoundPct);
         }
 
-        System.out.println("-".repeat(160));
+        System.out.println("-".repeat(170));
         double totalHitPct = total > 0 ? hitCount * 100.0 / total : 0;
         double totalMissPct = total > 0 ? missCount * 100.0 / total : 0;
         double totalNotFoundPct = total > 0 ? notFoundCount * 100.0 / total : 0;
-        System.out.printf("%-68s %6d %6d %6d %6d %8d %7.1f%% %7.1f%% %7.1f%%%n",
-            "TOTAL", hitCount, missCount, memCount, notFoundCount, total,
+        System.out.printf("%-90s %8d %6d %6d %6d %6d %7.1f%% %7.1f%% %7.1f%%%n",
+            "TOTAL", total, hitCount, missCount, memCount, notFoundCount,
             totalHitPct, totalMissPct, totalNotFoundPct);
 
         return 0;
@@ -559,6 +585,35 @@ public class FlatDbSstInspect implements Callable<Integer> {
       String computedHex = HEX.formatHex(computed);
       String keyAccHash = HEX.formatHex(flatKey, 0, ACCOUNT_HASH_LEN);
       return computedHex.equals(keyAccHash) ? address : null;
+    } catch (Exception e) {
+      return null;
+    }
+  }
+
+  private static String lookupContractName(String address, String apiKey) {
+    try {
+      String url = "https://api.etherscan.io/api?module=contract&action=getsourcecode&address="
+          + address + "&apikey=" + apiKey;
+      HttpURLConnection conn = (HttpURLConnection) URI.create(url).toURL().openConnection();
+      conn.setRequestMethod("GET");
+      conn.setConnectTimeout(5000);
+      conn.setReadTimeout(5000);
+      if (conn.getResponseCode() != 200) return null;
+
+      StringBuilder sb = new StringBuilder();
+      try (var reader = new BufferedReader(new InputStreamReader(conn.getInputStream(), StandardCharsets.UTF_8))) {
+        String line;
+        while ((line = reader.readLine()) != null) sb.append(line);
+      }
+      String json = sb.toString();
+      // Simple JSON extraction for "ContractName":"..."
+      int idx = json.indexOf("\"ContractName\":\"");
+      if (idx < 0) return null;
+      int start = idx + "\"ContractName\":\"".length();
+      int end = json.indexOf('"', start);
+      if (end <= start) return null;
+      String name = json.substring(start, end).trim();
+      return name.isEmpty() ? null : name;
     } catch (Exception e) {
       return null;
     }
